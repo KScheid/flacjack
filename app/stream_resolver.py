@@ -36,6 +36,15 @@ CACHE_TTL_SEARCH = int(os.environ.get("CACHE_TTL_SECONDS", "3600"))
 CACHE_TTL_STREAM = int(os.environ.get("CACHE_TTL_STREAM", "3600"))
 
 
+def sanitize_track_id(track_id: str) -> str:
+    """Strips file extensions and prevents path traversal characters."""
+    raw = str(track_id).replace(".flac", "").replace(".m4a", "").strip()
+    clean = re.sub(r"[^a-zA-Z0-9_\-]", "", raw)
+    if not clean:
+        raise HTTPException(status_code=400, detail="Invalid track ID")
+    return clean
+
+
 def cover_id_to_url(cover_id: Optional[str]) -> Optional[str]:
     """Converts a Tidal cover UUID to a high-resolution CDN URL."""
     if not cover_id:
@@ -46,15 +55,9 @@ def cover_id_to_url(cover_id: Optional[str]) -> Optional[str]:
     return f"https://resources.tidal.com/images/{formatted_path}/1280x1280.jpg"
 
 
-def sanitize_track_id(track_id: str) -> str:
-    """Strips extensions and sanitizes ID to prevent path traversal."""
-    cleaned = str(track_id).replace(".flac", "").replace(".m4a", "").strip()
-    return re.sub(r'[^a-zA-Z0-9_\-]', '', cleaned)
-
-
 class StreamResolver:
     def __init__(self):
-        pass
+        self._stream_client: Optional[httpx.AsyncClient] = None
 
     # ── Search & Metadata Normalization ──────────────────────────────────────
 
@@ -64,30 +67,27 @@ class StreamResolver:
         quality: str = QualityTier.HI_RES_LOSSLESS.value,
         limit: int = 25,
         offset: int = 0,
-        base_url: str = ""
+        base_url: str = "",
     ) -> AddonSearchResponse:
-        """
-        Unified search endpoint. Checks local SQLite cache, queries upstream
-        mirrors with per-mirror strategy failover, and returns normalized AddonTrack items.
-        """
         cleaned_query = query.strip()
         if not cleaned_query:
             return AddonSearchResponse(tracks=[])
 
-        # 1. Check local cache
         cached = await db.get_cached_search(cleaned_query, quality, limit, offset)
         if cached:
-            tracks = [AddonTrack(**t) for t in cached.get("tracks", [])]
+            tracks = []
+            for t in cached.get("tracks", []):
+                track_obj = AddonTrack(**t)
+                if base_url:
+                    track_obj.streamURL = f"{base_url.rstrip('/')}/stream/audio/{track_obj.id}.flac"
+                tracks.append(track_obj)
             return AddonSearchResponse(tracks=tracks)
 
-        # 2. Search upstream — try all strategies per mirror before failing over
         tracks: List[AddonTrack] = []
         raw_items: List[Dict[str, Any]] = []
 
         strategies = [
-            # Modern tracks.monochrome.st endpoint
             ("/search", {"q": cleaned_query}),
-            # Standard hifi-api / Tidal endpoints
             ("/search", {"s": cleaned_query, "limit": limit, "offset": offset}),
             ("/search/?s=" + cleaned_query, {"limit": limit, "offset": offset}),
             ("/search?s=" + cleaned_query, {"limit": limit, "offset": offset}),
@@ -106,7 +106,6 @@ class StreamResolver:
                     try:
                         resp = await client.get(full_url, params=params, timeout=4.0)
                         if resp.status_code == 200:
-                            # Validate not an ad redirect
                             text_head = resp.text[:500].lower()
                             if "redirecting..." in text_head or "prebid-wrapper" in text_head:
                                 mirror_manager.mark_mirror_failure(mirror_url, "Ad redirect")
@@ -116,15 +115,15 @@ class StreamResolver:
                                 data = resp.json()
                                 tracks, raw_items = self._normalize_search_response(data, base_url)
                                 if tracks:
-                                    break  # Found results, exit strategy loop
+                                    break
                             except Exception as e:
                                 logger.warning(f"Failed to parse search JSON from {mirror_url}: {e}")
-                                continue  # Try next strategy on same mirror
+                                continue
                         elif resp.status_code in (429, 502, 503, 504):
                             mirror_manager.mark_mirror_failure(mirror_url, f"HTTP {resp.status_code}")
                             mirror_failed = True
                         elif resp.status_code == 404:
-                            continue  # Try next strategy on same mirror
+                            continue
                     except (httpx.TimeoutException, asyncio.TimeoutError):
                         mirror_manager.mark_mirror_failure(mirror_url, "Timeout")
                         mirror_failed = True
@@ -133,24 +132,20 @@ class StreamResolver:
                         mirror_failed = True
 
                 if tracks:
-                    break  # Found results, exit mirror loop
+                    break
 
         if not tracks:
-            # All upstream attempts failed; return empty rather than crashing
             logger.warning(f"No results found for query '{cleaned_query}' across all mirrors.")
             return AddonSearchResponse(tracks=[])
 
-        # Slice to requested limit
         paged_tracks = tracks[offset : offset + limit] if offset > 0 else tracks[:limit]
 
-        # 3. Cache results
         cache_payload = {
             "tracks": [t.model_dump() for t in paged_tracks],
-            "total": len(tracks)
+            "total": len(tracks),
         }
         await db.set_cached_search(cleaned_query, quality, limit, offset, cache_payload, ttl=CACHE_TTL_SEARCH)
 
-        # Also populate individual track cache for instant single-track lookups
         for t in paged_tracks:
             await db.set_cached_track(t.id, t.model_dump(), ttl=86400)
 
@@ -159,13 +154,11 @@ class StreamResolver:
     def _normalize_search_response(
         self,
         data: Any,
-        base_url: str = ""
+        base_url: str = "",
     ) -> Tuple[List[AddonTrack], List[Dict[str, Any]]]:
-        """Converts heterogeneous upstream search responses into normalized AddonTrack list."""
         tracks: List[AddonTrack] = []
         raw_items: List[Dict[str, Any]] = []
 
-        # Case A: tracks.monochrome.st format: {"tracks": [...]}
         if isinstance(data, dict) and "tracks" in data and isinstance(data["tracks"], list):
             raw_items = data["tracks"]
             for item in raw_items:
@@ -196,12 +189,11 @@ class StreamResolver:
                     audioModes=["STEREO"],
                     streamURL=stream_url,
                     isrc=item.get("isrc"),
-                    trackNumber=item.get("trackNumber")
+                    trackNumber=item.get("trackNumber"),
                 )
                 tracks.append(track)
             return tracks, raw_items
 
-        # Case B: Standard Tidal / hifi-api format: {"data": {"items": [...]}} or {"items": [...]}
         items = []
         if isinstance(data, dict):
             if "data" in data and isinstance(data["data"], dict) and "items" in data["data"]:
@@ -215,7 +207,6 @@ class StreamResolver:
 
         raw_items = items
         for item in items:
-            # Handle nested item objects in playlist / search results
             t = item.get("item", item) if isinstance(item, dict) else item
             if not isinstance(t, dict):
                 continue
@@ -229,7 +220,11 @@ class StreamResolver:
             if artists_list and isinstance(artists_list, list):
                 artist = ", ".join([a.get("name", "") for a in artists_list if isinstance(a, dict) and a.get("name")])
             else:
-                artist = t.get("artist", {}).get("name") if isinstance(t.get("artist"), dict) else (t.get("artist") or "Unknown Artist")
+                artist = (
+                    t.get("artist", {}).get("name")
+                    if isinstance(t.get("artist"), dict)
+                    else (t.get("artist") or "Unknown Artist")
+                )
 
             album_obj = t.get("album") if isinstance(t.get("album"), dict) else {}
             album_title = album_obj.get("title") or ""
@@ -259,7 +254,7 @@ class StreamResolver:
                 atmos=is_atmos,
                 streamURL=stream_url,
                 isrc=t.get("isrc"),
-                trackNumber=t.get("trackNumber")
+                trackNumber=t.get("trackNumber"),
             )
             tracks.append(track)
 
@@ -268,13 +263,15 @@ class StreamResolver:
     # ── Track Metadata Lookup ────────────────────────────────────────────────
 
     async def get_track(self, track_id: str, base_url: str = "") -> Optional[AddonTrack]:
-        """Resolves track metadata by ID, checking cache first."""
-        cached = await db.get_cached_track(track_id)
+        clean_id = sanitize_track_id(track_id)
+        cached = await db.get_cached_track(clean_id)
         if cached:
-            return AddonTrack(**cached)
+            track_obj = AddonTrack(**cached)
+            if base_url:
+                track_obj.streamURL = f"{base_url.rstrip('/')}/stream/audio/{track_obj.id}.flac"
+            return track_obj
 
-        # Search or query info
-        for path in [f"/info/?id={track_id}", f"/info?id={track_id}", f"/track/{track_id}"]:
+        for path in [f"/info/?id={clean_id}", f"/info?id={clean_id}", f"/track/{clean_id}"]:
             try:
                 resp, _ = await mirror_manager.request_with_failover(path, timeout=3.5)
                 if resp.status_code == 200:
@@ -282,7 +279,7 @@ class StreamResolver:
                     item = data.get("data", data)
                     tracks, _ = self._normalize_search_response({"items": [item]}, base_url)
                     if tracks:
-                        await db.set_cached_track(track_id, tracks[0].model_dump())
+                        await db.set_cached_track(clean_id, tracks[0].model_dump())
                         return tracks[0]
             except Exception:
                 continue
@@ -295,23 +292,17 @@ class StreamResolver:
         self,
         track_id: str,
         quality: str = QualityTier.HI_RES_LOSSLESS.value,
-        base_url: str = ""
+        base_url: str = "",
     ) -> AddonStream:
-        """
-        Resolves a playable audio stream for BitChord with quality fallback.
-        1. Checks SQLite cache for instant playback.
-        2. Tries HI_RES_LOSSLESS (24-bit FLAC). If unavailable, falls back to LOSSLESS (16-bit FLAC).
-        3. If upstream returns base64 DASH manifest, decodes and parses media URLs.
-        4. Exposes our server's /stream/audio/{track_id} endpoint or clean direct URL.
-        """
-        clean_id = str(track_id).strip()
+        clean_id = sanitize_track_id(track_id)
 
-        # 1. Check cache
         cached = await db.get_cached_stream(clean_id, quality)
         if cached:
-            return AddonStream(**cached)
+            stream_obj = AddonStream(**cached)
+            if base_url and "/stream/audio/" in stream_obj.url:
+                stream_obj.url = f"{base_url.rstrip('/')}/stream/audio/{clean_id}.flac"
+            return stream_obj
 
-        # 2. Quality fallback chain
         quality_chain = [quality]
         if quality == QualityTier.HI_RES_LOSSLESS.value:
             quality_chain.extend([QualityTier.LOSSLESS.value, QualityTier.HIGH.value])
@@ -319,14 +310,14 @@ class StreamResolver:
             quality_chain.append(QualityTier.HIGH.value)
 
         resolved_stream = None
-        last_error = None
-
-        # Check if track is a 17-19 digit snowflake (tracks.monochrome.st backend)
-        is_snowflake = bool(re.match(r'^\d{17,20}$', clean_id))
+        is_snowflake = bool(re.match(r"^\d{17,20}$", clean_id))
 
         if is_snowflake:
-            # Snowflake IDs stream directly from tracks.monochrome.st
-            stream_endpoint = f"{base_url.rstrip('/')}/stream/audio/{clean_id}.flac" if base_url else f"/stream/audio/{clean_id}.flac"
+            stream_endpoint = (
+                f"{base_url.rstrip('/')}/stream/audio/{clean_id}.flac"
+                if base_url
+                else f"/stream/audio/{clean_id}.flac"
+            )
             resolved_stream = AddonStream(
                 url=stream_endpoint,
                 format="flac",
@@ -342,22 +333,23 @@ class StreamResolver:
                 bitDepth=24.0,
                 bitrate=3000000.0,
                 audioMode="STEREO",
-                encrypted=False
+                encrypted=False,
             )
         else:
-            # Standard Tidal / Hi-Fi ID: query upstream with quality fallback
             for tier in quality_chain:
                 try:
                     resolved_stream = await self._query_upstream_playback(clean_id, tier, base_url)
                     if resolved_stream and resolved_stream.url:
                         break
-                except Exception as e:
-                    last_error = e
+                except Exception:
                     continue
 
         if not resolved_stream or not resolved_stream.url:
-            # Fallback: serve our internal audio proxy URL anyway; it will resolve on stream fetch
-            stream_endpoint = f"{base_url.rstrip('/')}/stream/audio/{clean_id}.flac" if base_url else f"/stream/audio/{clean_id}.flac"
+            stream_endpoint = (
+                f"{base_url.rstrip('/')}/stream/audio/{clean_id}.flac"
+                if base_url
+                else f"/stream/audio/{clean_id}.flac"
+            )
             resolved_stream = AddonStream(
                 url=stream_endpoint,
                 format="flac",
@@ -368,10 +360,9 @@ class StreamResolver:
                 sampleRate=44100.0,
                 manifest="none",
                 encrypted=False,
-                error=None
+                error=None,
             )
 
-        # Cache resolved stream info
         await db.set_cached_stream(clean_id, quality, resolved_stream.model_dump(), ttl=CACHE_TTL_STREAM)
         return resolved_stream
 
@@ -379,9 +370,8 @@ class StreamResolver:
         self,
         track_id: str,
         quality: str,
-        base_url: str = ""
+        base_url: str = "",
     ) -> Optional[AddonStream]:
-        """Queries upstream mirrors for track playbackinfo / manifest."""
         endpoints = [
             f"/track/?id={track_id}&quality={quality}",
             f"/track?id={track_id}&quality={quality}",
@@ -405,15 +395,16 @@ class StreamResolver:
         track_id: str,
         quality: str,
         mirror_url: str,
-        base_url: str
+        base_url: str,
     ) -> AddonStream:
-        """
-        Parses playbackinfo response, decoding base64 JSON or DASH manifests.
-        """
-        # Case 1: Direct stream URL in payload
         if "url" in payload and payload["url"]:
             direct_url = payload["url"]
-            fmt = "flac" if ".flac" in direct_url or quality in (QualityTier.HI_RES_LOSSLESS.value, QualityTier.LOSSLESS.value) else "aac"
+            fmt = (
+                "flac"
+                if ".flac" in direct_url
+                or quality in (QualityTier.HI_RES_LOSSLESS.value, QualityTier.LOSSLESS.value)
+                else "aac"
+            )
             return AddonStream(
                 url=direct_url,
                 format=fmt,
@@ -423,10 +414,9 @@ class StreamResolver:
                 bitDepth=24.0 if quality == QualityTier.HI_RES_LOSSLESS.value else 16.0,
                 sampleRate=96000.0 if quality == QualityTier.HI_RES_LOSSLESS.value else 44100.0,
                 manifest="none",
-                encrypted=False
+                encrypted=False,
             )
 
-        # Case 2: Base64-encoded manifest
         manifest_b64 = payload.get("manifest")
         manifest_mime = payload.get("manifestMimeType", "")
 
@@ -435,11 +425,9 @@ class StreamResolver:
                 decoded_bytes = base64.b64decode(manifest_b64)
                 decoded_text = decoded_bytes.decode("utf-8", errors="ignore")
 
-                # Subcase 2A: DASH XML manifest
                 if manifest_mime == "application/dash+xml" or "<MPD" in decoded_text:
                     return self._parse_dash_manifest(decoded_text, track_id, quality, base_url)
 
-                # Subcase 2B: JSON manifest (e.g. application/vnd.tidal.bts)
                 try:
                     manifest_json = json.loads(decoded_text)
                     urls = manifest_json.get("urls", [])
@@ -456,7 +444,7 @@ class StreamResolver:
                             bitDepth=24.0 if quality == QualityTier.HI_RES_LOSSLESS.value else 16.0,
                             sampleRate=96000.0 if quality == QualityTier.HI_RES_LOSSLESS.value else 44100.0,
                             manifest="none",
-                            encrypted=False
+                            encrypted=False,
                         )
                 except json.JSONDecodeError:
                     pass
@@ -464,8 +452,11 @@ class StreamResolver:
             except Exception as e:
                 logger.warning(f"Failed to decode manifest for track {track_id}: {e}")
 
-        # Default fallback to our progressive stream endpoint
-        stream_endpoint = f"{base_url.rstrip('/')}/stream/audio/{track_id}.flac" if base_url else f"/stream/audio/{track_id}.flac"
+        stream_endpoint = (
+            f"{base_url.rstrip('/')}/stream/audio/{track_id}.flac"
+            if base_url
+            else f"/stream/audio/{track_id}.flac"
+        )
         return AddonStream(
             url=stream_endpoint,
             format="flac",
@@ -475,7 +466,7 @@ class StreamResolver:
             bitDepth=24.0 if quality == QualityTier.HI_RES_LOSSLESS.value else 16.0,
             sampleRate=96000.0 if quality == QualityTier.HI_RES_LOSSLESS.value else 44100.0,
             manifest="none",
-            encrypted=False
+            encrypted=False,
         )
 
     def _parse_dash_manifest(
@@ -483,17 +474,12 @@ class StreamResolver:
         xml_text: str,
         track_id: str,
         quality: str,
-        base_url: str
+        base_url: str,
     ) -> AddonStream:
-        """
-        Parses DASH MPD manifest. Extracts direct media URL if single BaseURL exists,
-        or configures clean streaming proxy URL so BitChord plays without errors.
-        """
         try:
             root = ET.fromstring(xml_text)
             ns = {"mpd": "urn:mpeg:dash:schema:mpd:2011"}
 
-            # Look for BaseURL inside Period / AdaptationSet / Representation
             base_urls = root.findall(".//mpd:BaseURL", ns) or root.findall(".//BaseURL")
             if base_urls and base_urls[0].text:
                 direct_url = base_urls[0].text.strip()
@@ -505,10 +491,9 @@ class StreamResolver:
                         codec="flac",
                         mimeType="audio/flac",
                         manifest="none",
-                        encrypted=False
+                        encrypted=False,
                     )
 
-            # Look for Representation audio parameters
             reps = root.findall(".//mpd:Representation", ns) or root.findall(".//Representation")
             bitrate = None
             sample_rate = 44100.0
@@ -520,8 +505,11 @@ class StreamResolver:
                 if sr:
                     sample_rate = float(sr)
 
-            # If segmented DASH, serve via our clean audio streaming endpoint
-            stream_endpoint = f"{base_url.rstrip('/')}/stream/audio/{track_id}.flac" if base_url else f"/stream/audio/{track_id}.flac"
+            stream_endpoint = (
+                f"{base_url.rstrip('/')}/stream/audio/{track_id}.flac"
+                if base_url
+                else f"/stream/audio/{track_id}.flac"
+            )
             return AddonStream(
                 url=stream_endpoint,
                 format="flac",
@@ -532,11 +520,15 @@ class StreamResolver:
                 sampleRate=sample_rate,
                 bitrate=bitrate or 1411000.0,
                 manifest="none",
-                encrypted=False
+                encrypted=False,
             )
         except Exception as e:
             logger.warning(f"Error parsing DASH XML for track {track_id}: {e}")
-            stream_endpoint = f"{base_url.rstrip('/')}/stream/audio/{track_id}.flac" if base_url else f"/stream/audio/{track_id}.flac"
+            stream_endpoint = (
+                f"{base_url.rstrip('/')}/stream/audio/{track_id}.flac"
+                if base_url
+                else f"/stream/audio/{track_id}.flac"
+            )
             return AddonStream(
                 url=stream_endpoint,
                 format="flac",
@@ -544,7 +536,7 @@ class StreamResolver:
                 codec="flac",
                 mimeType="audio/flac",
                 manifest="none",
-                encrypted=False
+                encrypted=False,
             )
 
     # ── Live Audio Proxy Streaming with HTTP Range Support & Disk Caching ────
@@ -553,17 +545,10 @@ class StreamResolver:
         self,
         file_path: str,
         request: Request,
-        disposition_filename: Optional[str] = None
+        disposition_filename: Optional[str] = None,
     ) -> Response:
-        """Serves a locally cached audio file with full HTTP Range request support."""
-        # Prevent path traversal
-        real_cache_dir = os.path.abspath(prefetcher.cache_dir)
-        real_file_path = os.path.abspath(file_path)
-        if not real_file_path.startswith(real_cache_dir) or not os.path.isfile(real_file_path):
-            raise HTTPException(status_code=404, detail="Audio file not found")
-
-        file_size = os.path.getsize(real_file_path)
-        is_flac = real_file_path.endswith(".flac")
+        file_size = os.path.getsize(file_path)
+        is_flac = file_path.endswith(".flac")
         media_type = "audio/flac" if is_flac else "audio/mp4"
 
         response_headers = {
@@ -573,17 +558,19 @@ class StreamResolver:
             "X-HiFi-Cache": "HIT",
         }
         if disposition_filename:
-            safe_name = re.sub(r'[^\w\s\-\.\(\),]', '_', disposition_filename)
+            safe_name = re.sub(r"[^\w\s\-\.\(\),]", "_", disposition_filename)
             response_headers["Content-Disposition"] = f'inline; filename="{safe_name}"'
 
         range_header = request.headers.get("range")
 
         if request.method == "HEAD":
             if range_header:
-                match = re.match(r'bytes=(\d+)-(\d*)', range_header)
+                match = re.match(r"bytes=(\d+)-(\d*)", range_header)
                 if match:
                     start = int(match.group(1))
-                    end = int(match.group(2)) if match.group(2) else file_size - 1
+                    if start >= file_size:
+                        raise HTTPException(status_code=416, detail="Requested range not satisfiable")
+                    end = min(int(match.group(2)), file_size - 1) if match.group(2) else file_size - 1
                     response_headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
                     response_headers["Content-Length"] = str(end - start + 1)
                     return Response(status_code=206, headers=response_headers, media_type=media_type)
@@ -591,7 +578,7 @@ class StreamResolver:
             return Response(status_code=200, headers=response_headers, media_type=media_type)
 
         if range_header:
-            match = re.match(r'bytes=(\d+)-(\d*)', range_header)
+            match = re.match(r"bytes=(\d+)-(\d*)", range_header)
             if match:
                 start = int(match.group(1))
                 end = int(match.group(2)) if match.group(2) else file_size - 1
@@ -602,14 +589,12 @@ class StreamResolver:
                 response_headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
                 response_headers["Content-Length"] = str(content_length)
 
-                async def iter_range():
-                    def _read(f, n):
-                        return f.read(n)
-                    with open(real_file_path, "rb") as f:
-                        await asyncio.to_thread(f.seek, start)
+                def iter_range():
+                    with open(file_path, "rb") as f:
+                        f.seek(start)
                         remaining = content_length
                         while remaining > 0:
-                            chunk = await asyncio.to_thread(_read, f, min(65536, remaining))
+                            chunk = f.read(min(65536, remaining))
                             if not chunk:
                                 break
                             remaining -= len(chunk)
@@ -619,38 +604,29 @@ class StreamResolver:
                     iter_range(),
                     status_code=206,
                     headers=response_headers,
-                    media_type=media_type
+                    media_type=media_type,
                 )
 
         response_headers["Content-Length"] = str(file_size)
-        async def iter_full():
-            def _read(f, n):
-                return f.read(n)
-            with open(real_file_path, "rb") as f:
-                while chunk := await asyncio.to_thread(_read, f, 65536):
+
+        def iter_full():
+            with open(file_path, "rb") as f:
+                while chunk := f.read(65536):
                     yield chunk
 
         return StreamingResponse(
             iter_full(),
             status_code=200,
             headers=response_headers,
-            media_type=media_type
+            media_type=media_type,
         )
 
     async def stream_audio_proxy(
         self,
         track_id: str,
-        request: Request
+        request: Request,
     ) -> Response:
-        """
-        Streams binary audio (FLAC) to BitChord/client with full HTTP Range support.
-        1. Checks local SSD disk cache (0ms latency, 100% immune to upstream rate limits).
-        2. If not cached, streams from fastest upstream mirror and tees into local disk cache.
-        3. Only promotes complete downloads to permanent cache; discards aborted/partial streams.
-        """
         clean_id = sanitize_track_id(track_id)
-        if not clean_id:
-            raise HTTPException(status_code=400, detail="Invalid track ID")
 
         # ── 1. Check local audio cache on disk (CACHE HIT) ────────────────────
         cached_path = prefetcher.get_cached_track_path(clean_id)
@@ -670,8 +646,9 @@ class StreamResolver:
         asyncio.create_task(prefetcher.queue_upcoming_from_context(clean_id))
 
         # ── 2. Stream from upstream mirror (CACHE MISS) ───────────────────────
-        if not hasattr(self, "_stream_client") or self._stream_client is None or self._stream_client.is_closed:
+        if self._stream_client is None or self._stream_client.is_closed:
             from app.mirror_manager import VERIFY_TLS
+
             self._stream_client = httpx.AsyncClient(
                 verify=VERIFY_TLS,
                 follow_redirects=True,
@@ -680,9 +657,8 @@ class StreamResolver:
             )
         client = self._stream_client
 
-        # Build list of candidate upstream URLs using mirror manager
         candidate_urls: List[str] = []
-        is_snowflake = bool(re.match(r'^\d{17,20}$', clean_id))
+        is_snowflake = bool(re.match(r"^\d{17,20}$", clean_id))
 
         if is_snowflake:
             for mirror_url in mirror_manager.get_ranked_mirrors():
@@ -694,7 +670,6 @@ class StreamResolver:
             for mirror_url in mirror_manager.get_ranked_mirrors():
                 candidate_urls.append(f"{mirror_url}/track/{clean_id}")
 
-        # Deduplicate while preserving order
         seen = set()
         unique_urls = []
         for u in candidate_urls:
@@ -703,7 +678,6 @@ class StreamResolver:
                 unique_urls.append(u)
         candidate_urls = unique_urls
 
-        # Prepare request headers including Range
         forward_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             "Accept": "*/*",
@@ -714,13 +688,11 @@ class StreamResolver:
         elif request.method == "HEAD":
             forward_headers["Range"] = "bytes=0-0"
 
-        # Try candidates with failover
         for target_url in candidate_urls:
             try:
                 req = client.build_request("GET", target_url, headers=forward_headers)
                 upstream_resp = await client.send(req, stream=True)
 
-                # If rate limited, briefly pause and retry once before skipping
                 if upstream_resp.status_code == 429:
                     logger.warning(f"Audio proxy candidate {target_url} returned 429, backing off 2.0s...")
                     await upstream_resp.aclose()
@@ -730,7 +702,6 @@ class StreamResolver:
 
                 if upstream_resp.status_code in (200, 206):
                     content_type = upstream_resp.headers.get("Content-Type", "").lower()
-                    # Validate that response is actually audio and NOT an HTML parking page / XML S3 error
                     if (
                         content_type.startswith("text/")
                         or "html" in content_type
@@ -740,7 +711,6 @@ class StreamResolver:
                         await upstream_resp.aclose()
                         continue
 
-                    # Prepare response headers
                     audio_content_type = upstream_resp.headers.get("Content-Type", "audio/flac")
                     response_headers = {
                         "Content-Type": audio_content_type,
@@ -753,107 +723,95 @@ class StreamResolver:
                     if "Content-Range" in upstream_resp.headers:
                         response_headers["Content-Range"] = upstream_resp.headers["Content-Range"]
 
-                    # Add Content-Disposition from cached track metadata
                     track_meta = await db.get_cached_track(clean_id)
                     if track_meta:
                         artist_name = track_meta.get("artist", "Unknown")
                         track_title = track_meta.get("title", clean_id)
-                        safe_name = re.sub(r'[^\w\s\-\.\(\),]', '_', f"{artist_name} - {track_title}")
+                        safe_name = re.sub(r"[^\w\s\-\.\(\),]", "_", f"{artist_name} - {track_title}")
                         response_headers["Content-Disposition"] = f'inline; filename="{safe_name}.flac"'
 
-                    # If this is a HEAD request from ExoPlayer, respond immediately with accurate headers
+                    # Fix HEAD response Content-Length when probing via bytes=0-0
                     if request.method == "HEAD":
                         await upstream_resp.aclose()
-                        # Bug 3 fix: When client sent no Range header, but we probed with bytes=0-0:
                         if not range_header and upstream_resp.status_code == 206:
                             cr = upstream_resp.headers.get("Content-Range", "")
-                            match = re.search(r'/(\d+)', cr)
-                            if match:
-                                response_headers["Content-Length"] = match.group(1)
+                            total_match = re.search(r"/(\d+)$", cr)
+                            if total_match:
+                                response_headers["Content-Length"] = total_match.group(1)
                             response_headers.pop("Content-Range", None)
                             return Response(
                                 content=b"",
                                 status_code=200,
                                 headers=response_headers,
-                                media_type=audio_content_type
+                                media_type=audio_content_type,
                             )
                         return Response(
                             content=b"",
                             status_code=upstream_resp.status_code,
                             headers=response_headers,
-                            media_type=audio_content_type
+                            media_type=audio_content_type,
                         )
 
-                    # Stream chunks and tee-to-disk cache ONLY if this is a full stream from byte 0
-                    is_full_stream = range_header is None or range_header.strip() == "" or range_header.startswith("bytes=0-")
-                    expected_total_bytes = 0
-                    if upstream_resp.status_code == 206:
-                        cr = upstream_resp.headers.get("Content-Range", "")
-                        match = re.search(r'/(\d+)', cr)
-                        if match:
-                            expected_total_bytes = int(match.group(1))
-                    elif upstream_resp.status_code == 200:
-                        cl = upstream_resp.headers.get("Content-Length", "")
-                        if cl.isdigit():
-                            expected_total_bytes = int(cl)
+                    # Only tee to disk cache when streaming from byte 0 with no open-ended byte limit
+                    is_full_stream = range_header is None or range_header == "bytes=0-"
+                    expected_total_bytes: Optional[int] = None
+                    if is_full_stream:
+                        if upstream_resp.status_code == 200 and "Content-Length" in upstream_resp.headers:
+                            expected_total_bytes = int(upstream_resp.headers["Content-Length"])
+                        elif upstream_resp.status_code == 206 and "Content-Range" in upstream_resp.headers:
+                            m = re.match(r"bytes 0-(\d+)/(\d+)", upstream_resp.headers["Content-Range"])
+                            if m and int(m.group(1)) == int(m.group(2)) - 1:
+                                expected_total_bytes = int(m.group(2))
+                            else:
+                                is_full_stream = False
 
-                    # Use distinct unique temp file to avoid collisions with prefetcher or concurrent streams
-                    unique_token = uuid.uuid4().hex[:8]
-                    temp_cache_file = os.path.join(prefetcher.cache_dir, f".tmp_proxy_{clean_id}_{unique_token}") if is_full_stream else None
-                    cache_handle = None
-                    if temp_cache_file:
-                        cache_handle = open(temp_cache_file, "wb")
-
-                    bytes_written = 0
-                    stream_completed_cleanly = False
+                    temp_cache_file = (
+                        os.path.join(prefetcher.cache_dir, f".tmp_proxy_{clean_id}_{uuid.uuid4().hex[:8]}")
+                        if is_full_stream
+                        else None
+                    )
+                    cache_handle = open(temp_cache_file, "wb") if temp_cache_file else None
 
                     async def stream_chunks():
-                        nonlocal bytes_written, stream_completed_cleanly
+                        bytes_written = 0
+                        completed_cleanly = False
                         try:
                             async for chunk in upstream_resp.aiter_bytes(chunk_size=65536):
                                 if cache_handle:
                                     await asyncio.to_thread(cache_handle.write, chunk)
                                     bytes_written += len(chunk)
                                 yield chunk
-
-                            # Stream finished without client disconnecting early
-                            if expected_total_bytes > 0:
-                                if bytes_written >= expected_total_bytes:
-                                    stream_completed_cleanly = True
-                            elif bytes_written > 10240:
-                                stream_completed_cleanly = True
+                            completed_cleanly = True
                         finally:
                             await upstream_resp.aclose()
                             if cache_handle:
-                                await asyncio.to_thread(cache_handle.close)
-                                if stream_completed_cleanly and temp_cache_file and os.path.exists(temp_cache_file):
-                                    def _finalize():
-                                        with open(temp_cache_file, "rb") as hf:
-                                            hdr = hf.read(16)
-                                        ext = ".flac" if hdr.startswith(b"fLaC") else ".m4a"
-                                        final_file = os.path.join(prefetcher.cache_dir, f"{clean_id}{ext}")
-                                        if os.path.exists(final_file):
-                                            os.remove(final_file)
-                                        os.rename(temp_cache_file, final_file)
-                                        return final_file, ext
+                                cache_handle.close()
+                                is_complete = (
+                                    completed_cleanly
+                                    and bytes_written > 10240
+                                    and (expected_total_bytes is None or bytes_written >= expected_total_bytes)
+                                )
+                                if is_complete and temp_cache_file and os.path.exists(temp_cache_file):
+                                    with open(temp_cache_file, "rb") as hf:
+                                        hdr = hf.read(16)
+                                    ext = ".flac" if hdr.startswith(b"fLaC") else ".m4a"
+                                    final_file = os.path.join(prefetcher.cache_dir, f"{clean_id}{ext}")
+                                    os.replace(temp_cache_file, final_file)
+                                    logger.info(
+                                        f"[CACHE] Saved {clean_id}{ext} to local audio disk cache "
+                                        f"({bytes_written // 1024} KB)"
+                                    )
+                                elif temp_cache_file and os.path.exists(temp_cache_file):
                                     try:
-                                        final_file, ext = await asyncio.to_thread(_finalize)
-                                        logger.info(f"[CACHE] Complete stream saved: {clean_id}{ext} ({os.path.getsize(final_file) // 1024} KB)")
-                                    except Exception as e:
-                                        logger.warning(f"[CACHE] Error finalizing cache file: {e}")
-                                else:
-                                    # Aborted/partial stream: discard incomplete temp file
-                                    if temp_cache_file and os.path.exists(temp_cache_file):
-                                        try:
-                                            await asyncio.to_thread(os.remove, temp_cache_file)
-                                        except Exception:
-                                            pass
+                                        os.remove(temp_cache_file)
+                                    except Exception:
+                                        pass
 
                     return StreamingResponse(
                         stream_chunks(),
                         status_code=upstream_resp.status_code,
                         headers=response_headers,
-                        media_type=audio_content_type
+                        media_type=audio_content_type,
                     )
                 else:
                     logger.debug(f"Audio proxy candidate {target_url} returned status {upstream_resp.status_code}")
@@ -868,11 +826,11 @@ class StreamResolver:
     # ── Album Details Lookup ─────────────────────────────────────────────────
 
     async def get_album(self, album_id: str, base_url: str = "") -> AlbumDetail:
-        """Fetches album metadata and tracklist."""
+        clean_album_id = sanitize_track_id(album_id)
         endpoints = [
-            f"/album/?id={album_id}",
-            f"/album?id={album_id}",
-            f"/release/{album_id}"
+            f"/album/?id={clean_album_id}",
+            f"/album?id={clean_album_id}",
+            f"/release/{clean_album_id}",
         ]
         data = None
         for ep in endpoints:
@@ -892,11 +850,13 @@ class StreamResolver:
 
         title = item.get("title") or "Unknown Album"
         artist_obj = item.get("artist") or {}
-        artist_name = artist_obj.get("name") if isinstance(artist_obj, dict) else (item.get("artistName") or "Unknown Artist")
+        artist_name = (
+            artist_obj.get("name") if isinstance(artist_obj, dict) else (item.get("artistName") or "Unknown Artist")
+        )
         cover = cover_id_to_url(item.get("cover"))
 
         return AlbumDetail(
-            id=str(album_id),
+            id=str(clean_album_id),
             title=title,
             artist=artist_name,
             artistId=str(artist_obj.get("id")) if isinstance(artist_obj, dict) and artist_obj.get("id") else None,
@@ -905,16 +865,16 @@ class StreamResolver:
             numberOfTracks=len(tracks),
             duration=float(item.get("duration", 0)) if item.get("duration") else None,
             audioQuality=item.get("audioQuality", "LOSSLESS"),
-            tracks=tracks
+            tracks=tracks,
         )
 
     # ── Artist Details Lookup ────────────────────────────────────────────────
 
     async def get_artist(self, artist_id: str, base_url: str = "") -> ArtistDetail:
-        """Fetches artist details and popular tracks."""
+        clean_artist_id = sanitize_track_id(artist_id)
         endpoints = [
-            f"/artist/?id={artist_id}",
-            f"/artist?id={artist_id}",
+            f"/artist/?id={clean_artist_id}",
+            f"/artist?id={clean_artist_id}",
         ]
         data = None
         for ep in endpoints:
@@ -935,14 +895,13 @@ class StreamResolver:
         picture = cover_id_to_url(item.get("picture"))
 
         return ArtistDetail(
-            id=str(artist_id),
+            id=str(clean_artist_id),
             name=name,
             picture=picture,
             bio=item.get("bio"),
             topTracks=tracks,
-            albums=item.get("albums", [])
+            albums=item.get("albums", []),
         )
 
 
-# Singleton stream resolver instance
 stream_resolver = StreamResolver()
