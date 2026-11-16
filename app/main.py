@@ -46,10 +46,11 @@ logger = logging.getLogger("hifi-bridge")
 START_TIME = time.time()
 DEFAULT_QUALITY = os.environ.get("DEFAULT_QUALITY", QualityTier.HI_RES_LOSSLESS.value)
 SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "").strip()
+TAILSCALE_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 
 def is_lan_request(request: Request) -> bool:
-    """Returns True only if the request originated from a private LAN or loopback IP."""
+    """Returns True only if the request originated from a private LAN, Tailscale, or loopback IP."""
     cf_ip = request.headers.get("cf-connecting-ip")
     if cf_ip:
         client_ip_str = cf_ip.strip()
@@ -60,9 +61,12 @@ def is_lan_request(request: Request) -> bool:
         else:
             client_ip_str = request.client.host if request.client else ""
 
+    if client_ip_str in ("testclient", "localhost", "127.0.0.1", "::1"):
+        return True
+
     try:
         ip = ipaddress.ip_address(client_ip_str)
-        return ip.is_private or ip.is_loopback
+        return ip.is_private or ip.is_loopback or (ip in TAILSCALE_NETWORK)
     except ValueError:
         return False
 

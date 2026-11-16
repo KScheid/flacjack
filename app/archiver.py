@@ -86,11 +86,17 @@ class FlacArchiver:
             os.makedirs(self.music_dir, exist_ok=True)
             logger.info(f"Audio Archiver enabled. Destination directory: {self.music_dir}")
 
-    def trigger_archive(self, track: AddonTrack, track_id: str, direct_audio_url: Optional[str] = None):
+    def trigger_archive(self, track: AddonTrack, track_id_or_url: str, direct_audio_url: Optional[str] = None):
         """Fires background archiving task if archiver is enabled."""
         if not self.enabled:
             return
-        task = asyncio.create_task(self._archive_task(track, track_id, direct_audio_url))
+        if track_id_or_url.startswith("http://") or track_id_or_url.startswith("https://"):
+            actual_url = track_id_or_url
+            actual_id = track.id
+        else:
+            actual_url = direct_audio_url
+            actual_id = track_id_or_url
+        task = asyncio.create_task(self._archive_task(track, actual_id, actual_url))
         self._active_tasks.add(task)
         task.add_done_callback(self._active_tasks.discard)
 
