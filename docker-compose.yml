@@ -17,8 +17,8 @@ services:
       - DEFAULT_QUALITY=HI_RES_LOSSLESS   # Options: HI_RES_LOSSLESS, LOSSLESS, HIGH
       - AUDIO_CACHE_DIR=/data/audio_cache # Local disk cache for 0ms seek & rate limit immunity
       - MAX_CACHE_GB=10                   # Max disk space allocated for audio cache
-      - PREFETCH_LOOKAHEAD=2              # Automatically prefetch the next 2 tracks in queue
-      - PREFETCH_ENABLED=true             # Enable background lookahead caching
+      - PREFETCH_LOOKAHEAD=2              # Number of upcoming tracks to prefetch when enabled
+      - PREFETCH_ENABLED=false            # Disabled to prevent Cloudflare 429 rate-limiting on single IP
       - ENABLE_FLAC_ARCHIVE=false         # Set to true to archive all streamed FLAC files to /music
       - CACHE_TTL_SECONDS=3600            # Cache metadata and searches in SQLite for 1 hour
       - DB_PATH=/data/hifi_bridge.db

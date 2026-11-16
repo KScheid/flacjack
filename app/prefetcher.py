@@ -24,7 +24,7 @@ CACHE_DIR = os.environ.get(
 )
 MAX_CACHE_GB = float(os.environ.get("MAX_CACHE_GB", "5.0"))
 PREFETCH_LOOKAHEAD = int(os.environ.get("PREFETCH_LOOKAHEAD", "2"))
-PREFETCH_ENABLED = os.environ.get("PREFETCH_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+PREFETCH_ENABLED = os.environ.get("PREFETCH_ENABLED", "false").lower() in ("true", "1", "yes", "on")
 
 
 class PrefetchManager:
