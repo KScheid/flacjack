@@ -1,0 +1,45 @@
+services:
+  hifi-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hifi-bridge:latest
+    container_name: hifi-bridge
+    restart: unless-stopped
+    ports:
+      - "8742:8742"
+    environment:
+      # Unraid User/Group mapping (Default nobody:users = 99:100)
+      - PUID=99
+      - PGID=100
+      - PORT=8742
+      - HOST=0.0.0.0
+      - DEFAULT_QUALITY=HI_RES_LOSSLESS   # Options: HI_RES_LOSSLESS, LOSSLESS, HIGH
+      - AUDIO_CACHE_DIR=/data/audio_cache # Local disk cache for 0ms seek & rate limit immunity
+      - MAX_CACHE_GB=10                   # Max disk space allocated for audio cache
+      - PREFETCH_LOOKAHEAD=2              # Automatically prefetch the next 2 tracks in queue
+      - PREFETCH_ENABLED=true             # Enable background lookahead caching
+      - ENABLE_FLAC_ARCHIVE=false         # Set to true to archive all streamed FLAC files to /music
+      - CACHE_TTL_SECONDS=3600            # Cache metadata and searches in SQLite for 1 hour
+      - DB_PATH=/data/hifi_bridge.db
+      - MUSIC_DIR=/music
+      # Optional: Override or add custom mirrors
+      # - EXTRA_MIRRORS=https://custom-hifi.yourdomain.com
+    volumes:
+      # For Unraid: map to /mnt/user/appdata/hifi-bridge/data and /mnt/user/music
+      - ./data:/data
+      - ./music:/music
+    labels:
+      net.unraid.docker.icon: "https://raw.githubusercontent.com/walkxcode/dashboard-icons/main/svg/music.svg"
+      net.unraid.docker.webui: "http://[IP]:[PORT:8742]/"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8742/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Runtime data
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Certificates & Secret Keys (Never push TLS certificates or private keys)
+*.crt
+*.key
+*.pem
+*.pfx
+*.p12
+
+# Audio files & samples (local only)
+*.flac
+*.m4a
+*.mp3
+*.wav
+music/
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
