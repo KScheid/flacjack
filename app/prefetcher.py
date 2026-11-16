@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import time
+import uuid
 from typing import Any, Dict, List, Optional, Set
 import httpx
 
@@ -25,6 +26,12 @@ CACHE_DIR = os.environ.get(
 MAX_CACHE_GB = float(os.environ.get("MAX_CACHE_GB", "5.0"))
 PREFETCH_LOOKAHEAD = int(os.environ.get("PREFETCH_LOOKAHEAD", "2"))
 PREFETCH_ENABLED = os.environ.get("PREFETCH_ENABLED", "false").lower() in ("true", "1", "yes", "on")
+
+
+def sanitize_track_id(track_id: str) -> str:
+    """Strips extensions and removes any path traversal or unsafe characters."""
+    cleaned = str(track_id).replace(".flac", "").replace(".m4a", "").strip()
+    return re.sub(r'[^a-zA-Z0-9_\-]', '', cleaned)
 
 
 class PrefetchManager:
@@ -74,17 +81,23 @@ class PrefetchManager:
     # ── Cache Access & Query ──────────────────────────────────────────────────
 
     def get_cached_track_path(self, track_id: str) -> Optional[str]:
-        """Returns file path if track is fully cached on disk."""
-        clean_id = str(track_id).replace(".flac", "").strip()
+        """Returns file path if track is fully cached on disk, preventing path traversal."""
+        clean_id = sanitize_track_id(track_id)
+        if not clean_id:
+            return None
+        real_cache_dir = os.path.abspath(self.cache_dir)
         for ext in (".flac", ".m4a"):
             path = os.path.join(self.cache_dir, f"{clean_id}{ext}")
-            if os.path.isfile(path) and os.path.getsize(path) > 10240:
+            real_path = os.path.abspath(path)
+            if not real_path.startswith(real_cache_dir):
+                return None
+            if os.path.isfile(real_path) and os.path.getsize(real_path) > 10240:
                 # Update atime for LRU tracking
                 try:
-                    os.utime(path, None)
+                    os.utime(real_path, None)
                 except Exception:
                     pass
-                return path
+                return real_path
         return None
 
     def record_request(self, is_hit: bool):
@@ -93,12 +106,10 @@ class PrefetchManager:
         if is_hit:
             self._total_cache_hits += 1
 
-    def get_cache_stats(self) -> Dict[str, Any]:
-        """Returns statistics on local disk cache."""
+    def _read_cache_stats_sync(self):
         total_bytes = 0
         total_files = 0
         cached_files = []
-
         try:
             if os.path.isdir(self.cache_dir):
                 for f in os.scandir(self.cache_dir):
@@ -115,6 +126,11 @@ class PrefetchManager:
                         })
         except Exception as e:
             logger.warning(f"[PREFETCH] Error reading cache dir stats: {e}")
+        return total_bytes, total_files, cached_files
+
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Returns statistics on local disk cache."""
+        total_bytes, total_files, cached_files = self._read_cache_stats_sync()
 
         # Sort newest accessed first
         cached_files.sort(key=lambda x: x["last_accessed"], reverse=True)
@@ -251,23 +267,28 @@ class PrefetchManager:
         from app.mirror_manager import mirror_manager
         from app.stream_resolver import stream_resolver
 
-        logger.info(f"[PREFETCH] Starting background download for track {track_id}...")
-        temp_path = os.path.join(self.cache_dir, f".tmp_{track_id}")
+        clean_id = sanitize_track_id(track_id)
+        if not clean_id:
+            return
+
+        logger.info(f"[PREFETCH] Starting background download for track {clean_id}...")
+        unique_token = uuid.uuid4().hex[:8]
+        temp_path = os.path.join(self.cache_dir, f".tmp_pf_{clean_id}_{unique_token}")
 
         try:
             # 1. Resolve candidate URLs
             candidate_urls: List[str] = []
-            is_snowflake = bool(re.match(r'^\d{17,20}$', track_id))
+            is_snowflake = bool(re.match(r'^\d{17,20}$', clean_id))
 
             if is_snowflake:
                 for m in mirror_manager.get_ranked_mirrors():
-                    candidate_urls.append(f"{m}/track/{track_id}")
+                    candidate_urls.append(f"{m}/track/{clean_id}")
             else:
-                resolved = await stream_resolver.resolve_stream(track_id, QualityTier.HI_RES_LOSSLESS.value)
+                resolved = await stream_resolver.resolve_stream(clean_id, QualityTier.HI_RES_LOSSLESS.value)
                 if resolved.url and resolved.url.startswith("http") and "/stream/audio/" not in resolved.url:
                     candidate_urls.append(resolved.url)
                 for m in mirror_manager.get_ranked_mirrors():
-                    candidate_urls.append(f"{m}/track/{track_id}")
+                    candidate_urls.append(f"{m}/track/{clean_id}")
 
             # 2. Try candidate mirrors
             success = False
@@ -290,41 +311,66 @@ class PrefetchManager:
                         if ct.startswith("text/") or "html" in ct or "xml" in ct:
                             continue
 
+                        expected_bytes = 0
+                        cr = resp.headers.get("Content-Range", "")
+                        match = re.search(r'/(\d+)', cr)
+                        if match:
+                            expected_bytes = int(match.group(1))
+                        elif resp.headers.get("Content-Length", "").isdigit():
+                            expected_bytes = int(resp.headers.get("Content-Length"))
+
+                        bytes_downloaded = 0
                         with open(temp_path, "wb") as f:
                             async for chunk in resp.aiter_bytes(chunk_size=65536):
-                                f.write(chunk)
+                                await asyncio.to_thread(f.write, chunk)
+                                bytes_downloaded += len(chunk)
+
+                        # Enforce completeness
+                        if expected_bytes > 0 and bytes_downloaded < expected_bytes:
+                            logger.warning(f"[PREFETCH] Incomplete download for {clean_id}: {bytes_downloaded}/{expected_bytes} bytes")
+                            if os.path.exists(temp_path):
+                                await asyncio.to_thread(os.remove, temp_path)
+                            continue
 
                         success = True
                         break
                 except Exception as e:
                     logger.debug(f"[PREFETCH] Candidate {target_url} failed: {e}")
+                    if os.path.exists(temp_path):
+                        try:
+                            await asyncio.to_thread(os.remove, temp_path)
+                        except Exception:
+                            pass
                     continue
 
             if not success or not os.path.exists(temp_path) or os.path.getsize(temp_path) < 10240:
                 if os.path.exists(temp_path):
-                    os.remove(temp_path)
-                logger.warning(f"[PREFETCH] Could not prefetch track {track_id} from any candidate.")
+                    await asyncio.to_thread(os.remove, temp_path)
+                logger.warning(f"[PREFETCH] Could not prefetch track {clean_id} from any candidate.")
                 return
 
             # 3. Detect container and rename to final
-            with open(temp_path, "rb") as f:
-                header = f.read(16)
-            is_flac = header.startswith(b"fLaC")
-            ext = ".flac" if is_flac else ".m4a"
+            def _finalize_prefetch():
+                with open(temp_path, "rb") as f:
+                    header = f.read(16)
+                is_flac = header.startswith(b"fLaC")
+                ext = ".flac" if is_flac else ".m4a"
 
-            final_path = os.path.join(self.cache_dir, f"{track_id}{ext}")
-            if os.path.exists(final_path):
-                os.remove(final_path)
-            os.rename(temp_path, final_path)
+                final_path = os.path.join(self.cache_dir, f"{clean_id}{ext}")
+                if os.path.exists(final_path):
+                    os.remove(final_path)
+                os.rename(temp_path, final_path)
+                return final_path
 
+            final_path = await asyncio.to_thread(_finalize_prefetch)
             size_mb = round(os.path.getsize(final_path) / (1024 * 1024), 2)
-            logger.info(f"[PREFETCH] Successfully pre-cached track {track_id} ({size_mb} MB) -> {final_path}")
+            logger.info(f"[PREFETCH] Successfully pre-cached track {clean_id} ({size_mb} MB) -> {final_path}")
 
         except Exception as e:
-            logger.error(f"[PREFETCH] Error prefetching track {track_id}: {e}")
+            logger.error(f"[PREFETCH] Error prefetching track {clean_id}: {e}")
             if os.path.exists(temp_path):
                 try:
-                    os.remove(temp_path)
+                    await asyncio.to_thread(os.remove, temp_path)
                 except Exception:
                     pass
 

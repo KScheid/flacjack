@@ -153,7 +153,9 @@ def run_sync_api_tests(track_id: str):
         head_res = client.head(audio_path)
         assert head_res.status_code in (200, 206), f"HEAD request returned {head_res.status_code}"
         assert "Content-Type" in head_res.headers, "HEAD response missing Content-Type"
-        print(f" [PASS] HEAD request accepted: HTTP {head_res.status_code}, Content-Type: {head_res.headers.get('Content-Type')}")
+        content_len = int(head_res.headers.get("Content-Length", 0))
+        assert content_len > 1000, f"Bug 3 check: Content-Length must be full file size, got {content_len}"
+        print(f" [PASS] HEAD request accepted: HTTP {head_res.status_code}, Content-Length: {content_len}, Content-Type: {head_res.headers.get('Content-Type')}")
 
         print(f" Requesting bytes 0-1023 from {audio_path}...")
         range_res = client.get(audio_path, headers={"Range": "bytes=0-1023"})
@@ -229,6 +231,11 @@ def run_sync_api_tests(track_id: str):
             print(f" Cache stats: {cache_stats['total_files']} files, {cache_stats['total_mb']} MB, hit rate: {cache_stats['hit_rate_percent']}%")
             assert cache_stats["total_files"] >= 1
             print(" [PASS] Cache statistics and metrics verified.")
+
+            # Test path traversal resistance (Bug 2)
+            traversal_res = client.get("/stream/audio/..%2F..%2Fetc%2Fpasswd.flac")
+            assert traversal_res.status_code in (400, 404), f"Path traversal allowed: {traversal_res.status_code}"
+            print(" [PASS] Path traversal protection verified (sanitized & blocked).")
         finally:
             if os.path.exists(dummy_flac_path):
                 os.remove(dummy_flac_path)

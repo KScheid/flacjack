@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import uuid
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
 import httpx
@@ -43,6 +44,12 @@ def cover_id_to_url(cover_id: Optional[str]) -> Optional[str]:
         return cover_id
     formatted_path = cover_id.replace("-", "/")
     return f"https://resources.tidal.com/images/{formatted_path}/1280x1280.jpg"
+
+
+def sanitize_track_id(track_id: str) -> str:
+    """Strips extensions and sanitizes ID to prevent path traversal."""
+    cleaned = str(track_id).replace(".flac", "").replace(".m4a", "").strip()
+    return re.sub(r'[^a-zA-Z0-9_\-]', '', cleaned)
 
 
 class StreamResolver:
@@ -549,8 +556,14 @@ class StreamResolver:
         disposition_filename: Optional[str] = None
     ) -> Response:
         """Serves a locally cached audio file with full HTTP Range request support."""
-        file_size = os.path.getsize(file_path)
-        is_flac = file_path.endswith(".flac")
+        # Prevent path traversal
+        real_cache_dir = os.path.abspath(prefetcher.cache_dir)
+        real_file_path = os.path.abspath(file_path)
+        if not real_file_path.startswith(real_cache_dir) or not os.path.isfile(real_file_path):
+            raise HTTPException(status_code=404, detail="Audio file not found")
+
+        file_size = os.path.getsize(real_file_path)
+        is_flac = real_file_path.endswith(".flac")
         media_type = "audio/flac" if is_flac else "audio/mp4"
 
         response_headers = {
@@ -589,12 +602,14 @@ class StreamResolver:
                 response_headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
                 response_headers["Content-Length"] = str(content_length)
 
-                def iter_range():
-                    with open(file_path, "rb") as f:
-                        f.seek(start)
+                async def iter_range():
+                    def _read(f, n):
+                        return f.read(n)
+                    with open(real_file_path, "rb") as f:
+                        await asyncio.to_thread(f.seek, start)
                         remaining = content_length
                         while remaining > 0:
-                            chunk = f.read(min(65536, remaining))
+                            chunk = await asyncio.to_thread(_read, f, min(65536, remaining))
                             if not chunk:
                                 break
                             remaining -= len(chunk)
@@ -608,9 +623,11 @@ class StreamResolver:
                 )
 
         response_headers["Content-Length"] = str(file_size)
-        def iter_full():
-            with open(file_path, "rb") as f:
-                while chunk := f.read(65536):
+        async def iter_full():
+            def _read(f, n):
+                return f.read(n)
+            with open(real_file_path, "rb") as f:
+                while chunk := await asyncio.to_thread(_read, f, 65536):
                     yield chunk
 
         return StreamingResponse(
@@ -629,9 +646,11 @@ class StreamResolver:
         Streams binary audio (FLAC) to BitChord/client with full HTTP Range support.
         1. Checks local SSD disk cache (0ms latency, 100% immune to upstream rate limits).
         2. If not cached, streams from fastest upstream mirror and tees into local disk cache.
-        3. Automatically triggers background lookahead prefetching for upcoming tracks in queue.
+        3. Only promotes complete downloads to permanent cache; discards aborted/partial streams.
         """
-        clean_id = str(track_id).replace(".flac", "").strip()
+        clean_id = sanitize_track_id(track_id)
+        if not clean_id:
+            raise HTTPException(status_code=400, detail="Invalid track ID")
 
         # ── 1. Check local audio cache on disk (CACHE HIT) ────────────────────
         cached_path = prefetcher.get_cached_track_path(clean_id)
@@ -742,41 +761,93 @@ class StreamResolver:
                         safe_name = re.sub(r'[^\w\s\-\.\(\),]', '_', f"{artist_name} - {track_title}")
                         response_headers["Content-Disposition"] = f'inline; filename="{safe_name}.flac"'
 
-                    # If this is a HEAD request from ExoPlayer, respond immediately with headers only
+                    # If this is a HEAD request from ExoPlayer, respond immediately with accurate headers
                     if request.method == "HEAD":
                         await upstream_resp.aclose()
+                        # Bug 3 fix: When client sent no Range header, but we probed with bytes=0-0:
+                        if not range_header and upstream_resp.status_code == 206:
+                            cr = upstream_resp.headers.get("Content-Range", "")
+                            match = re.search(r'/(\d+)', cr)
+                            if match:
+                                response_headers["Content-Length"] = match.group(1)
+                            response_headers.pop("Content-Range", None)
+                            return Response(
+                                content=b"",
+                                status_code=200,
+                                headers=response_headers,
+                                media_type=audio_content_type
+                            )
                         return Response(
                             content=b"",
-                            status_code=200 if upstream_resp.status_code == 206 else upstream_resp.status_code,
+                            status_code=upstream_resp.status_code,
                             headers=response_headers,
                             media_type=audio_content_type
                         )
 
-                    # Stream chunks and tee-to-disk cache if request starts from 0
-                    is_full_stream = range_header is None or range_header.startswith("bytes=0-")
-                    temp_cache_file = os.path.join(prefetcher.cache_dir, f".tmp_{clean_id}") if is_full_stream else None
-                    cache_handle = open(temp_cache_file, "wb") if temp_cache_file else None
+                    # Stream chunks and tee-to-disk cache ONLY if this is a full stream from byte 0
+                    is_full_stream = range_header is None or range_header.strip() == "" or range_header.startswith("bytes=0-")
+                    expected_total_bytes = 0
+                    if upstream_resp.status_code == 206:
+                        cr = upstream_resp.headers.get("Content-Range", "")
+                        match = re.search(r'/(\d+)', cr)
+                        if match:
+                            expected_total_bytes = int(match.group(1))
+                    elif upstream_resp.status_code == 200:
+                        cl = upstream_resp.headers.get("Content-Length", "")
+                        if cl.isdigit():
+                            expected_total_bytes = int(cl)
+
+                    # Use distinct unique temp file to avoid collisions with prefetcher or concurrent streams
+                    unique_token = uuid.uuid4().hex[:8]
+                    temp_cache_file = os.path.join(prefetcher.cache_dir, f".tmp_proxy_{clean_id}_{unique_token}") if is_full_stream else None
+                    cache_handle = None
+                    if temp_cache_file:
+                        cache_handle = open(temp_cache_file, "wb")
+
+                    bytes_written = 0
+                    stream_completed_cleanly = False
 
                     async def stream_chunks():
+                        nonlocal bytes_written, stream_completed_cleanly
                         try:
                             async for chunk in upstream_resp.aiter_bytes(chunk_size=65536):
                                 if cache_handle:
-                                    cache_handle.write(chunk)
+                                    await asyncio.to_thread(cache_handle.write, chunk)
+                                    bytes_written += len(chunk)
                                 yield chunk
+
+                            # Stream finished without client disconnecting early
+                            if expected_total_bytes > 0:
+                                if bytes_written >= expected_total_bytes:
+                                    stream_completed_cleanly = True
+                            elif bytes_written > 10240:
+                                stream_completed_cleanly = True
                         finally:
                             await upstream_resp.aclose()
                             if cache_handle:
-                                cache_handle.close()
-                                # Verify and finalize cached file
-                                if temp_cache_file and os.path.exists(temp_cache_file) and os.path.getsize(temp_cache_file) > 10240:
-                                    with open(temp_cache_file, "rb") as hf:
-                                        hdr = hf.read(16)
-                                    ext = ".flac" if hdr.startswith(b"fLaC") else ".m4a"
-                                    final_file = os.path.join(prefetcher.cache_dir, f"{clean_id}{ext}")
-                                    if os.path.exists(final_file):
-                                        os.remove(final_file)
-                                    os.rename(temp_cache_file, final_file)
-                                    logger.info(f"[CACHE] Saved {clean_id}{ext} to local audio disk cache ({os.path.getsize(final_file) // 1024} KB)")
+                                await asyncio.to_thread(cache_handle.close)
+                                if stream_completed_cleanly and temp_cache_file and os.path.exists(temp_cache_file):
+                                    def _finalize():
+                                        with open(temp_cache_file, "rb") as hf:
+                                            hdr = hf.read(16)
+                                        ext = ".flac" if hdr.startswith(b"fLaC") else ".m4a"
+                                        final_file = os.path.join(prefetcher.cache_dir, f"{clean_id}{ext}")
+                                        if os.path.exists(final_file):
+                                            os.remove(final_file)
+                                        os.rename(temp_cache_file, final_file)
+                                        return final_file, ext
+                                    try:
+                                        final_file, ext = await asyncio.to_thread(_finalize)
+                                        logger.info(f"[CACHE] Complete stream saved: {clean_id}{ext} ({os.path.getsize(final_file) // 1024} KB)")
+                                    except Exception as e:
+                                        logger.warning(f"[CACHE] Error finalizing cache file: {e}")
+                                else:
+                                    # Aborted/partial stream: discard incomplete temp file
+                                    if temp_cache_file and os.path.exists(temp_cache_file):
+                                        try:
+                                            await asyncio.to_thread(os.remove, temp_cache_file)
+                                        except Exception:
+                                            pass
 
                     return StreamingResponse(
                         stream_chunks(),

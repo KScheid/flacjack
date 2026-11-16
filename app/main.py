@@ -304,13 +304,7 @@ async def resolve_stream(
     if archiver.enabled:
         track = await stream_resolver.get_track(clean_id, base_url)
         if track:
-            target_url = stream_info.url
-            if "/stream/audio/" in target_url:
-                # Use the fastest mirror URL for direct download
-                ranked = mirror_manager.get_ranked_mirrors()
-                if ranked:
-                    target_url = f"{ranked[0]}/track/{clean_id}"
-            archiver.trigger_archive(track, target_url)
+            archiver.trigger_archive(track, clean_id, direct_audio_url=stream_info.url)
 
     return stream_info
 
