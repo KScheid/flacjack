@@ -121,7 +121,7 @@ def run_sync_api_tests(track_id: str):
         print(f"   Resources: {module_manifest.get('resources')}")
         print(f"   Quality Setting Default: {module_manifest['settings'][0]['default']}")
 
-        assert module_manifest["id"] == "hifi-bridge"
+        assert module_manifest["id"] == "flacjack"
         assert "search" in module_manifest["resources"]
         assert "stream" in module_manifest["resources"]
         assert module_manifest["baseUrl"] == "http://192.168.1.100:8742"
@@ -175,7 +175,7 @@ def run_sync_api_tests(track_id: str):
         print("=" * 60)
         dash_res = client.get("/dashboard")
         assert dash_res.status_code == 200, f"/dashboard returned {dash_res.status_code}"
-        assert "hifi-bridge" in dash_res.text, "Dashboard HTML missing service title"
+        assert "FlacJack" in dash_res.text, "Dashboard HTML missing service title"
         assert "BitChord Module URL" in dash_res.text, "Dashboard HTML missing BitChord section"
         print(" [PASS] GET /dashboard returns responsive HTML console.")
 
@@ -189,7 +189,7 @@ def run_sync_api_tests(track_id: str):
         root_json_res = client.get("/", headers={"Accept": "application/json"})
         assert root_json_res.status_code == 200
         root_data = root_json_res.json()
-        assert root_data["service"] == "hifi-bridge"
+        assert root_data["service"] == "flacjack"
         print(" [PASS] GET / with JSON Accept header returns API summary.")
 
         # Test /api/status

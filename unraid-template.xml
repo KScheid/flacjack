@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <Container version="2">
-  <Name>hifi-bridge</Name>
-  <Repository>hifi-bridge:latest</Repository>
+  <Name>flacjack</Name>
+  <Repository>flacjack:latest</Repository>
   <Registry/>
   <Network>bridge</Network>
   <MyIP/>
@@ -9,7 +9,7 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/monochrome-music</Support>
   <Project>https://github.com/monochrome-music</Project>
-  <Overview>Self-Hosted Hi-Fi Lossless Aggregator &amp; BitChord Source Module. Bridges public Hi-Fi lossless audio APIs with automatic failover, smart lookahead queue prefetching, and local SSD disk caching.</Overview>
+  <Overview>FlacJack 🥞 — Fresh, warm stacks of lossless audio on demand. Self-hosted Hi-Fi lossless aggregator and BitChord module with smart lookahead queue prefetching and local SSD caching.</Overview>
   <Category>MediaApp:Music MediaServer:Music</Category>
   <WebUI>http://[IP]:[PORT:8742]/</WebUI>
   <TemplateURL/>
@@ -22,7 +22,7 @@
   <DonateLink/>
   <Requires/>
   <Config Name="WebUI &amp; API Port" Target="8742" Default="8742" Mode="tcp" Description="Port for BitChord module API and WebUI Dashboard" Type="Port" Display="always" Required="true" Mask="false">8742</Config>
-  <Config Name="App Data Path" Target="/data" Default="/mnt/user/appdata/hifi-bridge/data" Mode="rw" Description="Location for database and local audio prefetch cache" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/hifi-bridge/data</Config>
+  <Config Name="App Data Path" Target="/data" Default="/mnt/user/appdata/flacjack/data" Mode="rw" Description="Location for database and local audio prefetch cache" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/flacjack/data</Config>
   <Config Name="Music Library Path" Target="/music" Default="/mnt/user/music" Mode="rw" Description="Location where archived FLAC tracks are saved (if archiving enabled)" Type="Path" Display="always" Required="false" Mask="false">/mnt/user/music</Config>
   <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="Unraid user ID (default 99 for nobody)" Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
   <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Unraid group ID (default 100 for users)" Type="Variable" Display="advanced" Required="false" Mask="false">100</Config>

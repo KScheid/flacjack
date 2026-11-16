@@ -1,10 +1,10 @@
 services:
-  hifi-bridge:
+  flacjack:
     build:
       context: .
       dockerfile: Dockerfile
-    image: hifi-bridge:latest
-    container_name: hifi-bridge
+    image: flacjack:latest
+    container_name: flacjack
     restart: unless-stopped
     ports:
       - "8742:8742"

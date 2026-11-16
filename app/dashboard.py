@@ -11,8 +11,8 @@ def render_dashboard_html(base_url: str, version: str = "2.0.0") -> str:
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>hifi-bridge — Lossless Audio Gateway</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎵</text></svg>">
+  <title>FlacJack 🥞 — Lossless Audio Gateway</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🥞</text></svg>">
   <script src="https://cdn.tailwindcss.com"></script>
   <script>
     tailwind.config = {{
@@ -46,18 +46,18 @@ def render_dashboard_html(base_url: str, version: str = "2.0.0") -> str:
   <header class="sticky top-0 z-50 glass border-b border-zinc-800/80 px-4 lg:px-8 py-3.5">
     <div class="max-w-7xl mx-auto flex items-center justify-between">
       <div class="flex items-center space-x-3">
-        <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-brand-600 to-emerald-400 flex items-center justify-center shadow-lg shadow-brand-500/20">
-          <span class="text-xl">🎵</span>
+        <div class="w-9 h-9 rounded-xl bg-gradient-to-tr from-amber-500 to-yellow-400 flex items-center justify-center shadow-lg shadow-amber-500/20">
+          <span class="text-xl">🥞</span>
         </div>
         <div>
           <div class="flex items-center space-x-2">
-            <h1 class="text-lg font-bold tracking-tight text-white">hifi-bridge</h1>
+            <h1 class="text-lg font-bold tracking-tight text-white">FlacJack</h1>
             <span class="text-xs font-semibold px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-400 border border-zinc-700/60">v{version}</span>
             <span id="status-pill" class="text-xs font-medium px-2 py-0.5 rounded-full bg-emerald-950 text-emerald-400 border border-emerald-800/80 flex items-center gap-1">
               <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span> ONLINE
             </span>
           </div>
-          <p class="text-xs text-zinc-400 hidden sm:block">Self-Hosted Hi-Fi Lossless Aggregator & BitChord Source</p>
+          <p class="text-xs text-zinc-400 hidden sm:block">Fresh, warm stacks of lossless audio on demand & BitChord Source</p>
         </div>
       </div>
       <div class="flex items-center space-x-3">

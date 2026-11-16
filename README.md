@@ -1,6 +1,6 @@
-# `hifi-bridge` — Self-Hosted Hi-Fi Lossless Aggregator & BitChord Source Module
+# `FlacJack` 🥞 — Fresh, Warm Stacks of Lossless Audio on Demand
 
-Production-ready, self-hosted Python (FastAPI) microservice that bridges public Hi-Fi lossless audio APIs (used by Monochrome) to the **BitChord** Android music client and any web browser.
+Production-ready, self-hosted Python (FastAPI) microservice bridging public Hi-Fi lossless audio APIs (Monochrome) to the **BitChord** Android music client and any modern web browser.
 
 ```
 ┌─────────────────────────────────┐
@@ -10,7 +10,7 @@ Production-ready, self-hosted Python (FastAPI) microservice that bridges public 
                  │ HTTPS / HTTP (Addon Protocol)
                  ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│                      `hifi-bridge` Microservice                        │
+│                        `FlacJack` 🥞 Microservice                      │
 │  ├─ Embedded WebUI Dashboard (Dark Mode, Latency, In-Browser Player)   │
 │  ├─ Dynamic BitChord Module (/bitchord-module.json)                   │
 │  ├─ Smart Lookahead Queue Prefetcher & Local SSD Audio Disk Cache      │

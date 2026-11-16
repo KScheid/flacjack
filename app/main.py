@@ -65,10 +65,10 @@ def get_request_base_url(request: Request) -> str:
 def build_addon_manifest(base_url: str) -> AddonManifest:
     """Builds the BitChord-compatible AddonManifest descriptor."""
     return AddonManifest(
-        id="hifi-bridge",
-        name="Hi-Fi Bridge (Monochrome Lossless)",
+        id="flacjack",
+        name="FlacJack 🥞",
         version="2.0.0",
-        description="Self-Hosted Hi-Fi Lossless Aggregator bridging public Hi-Fi APIs to BitChord",
+        description="Fresh, warm stacks of lossless audio on demand (BitChord Source Module)",
         baseUrl=base_url,
         resources=["search", "stream"],
         settings=[
@@ -133,9 +133,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="hifi-bridge",
-    description="Self-Hosted Hi-Fi Lossless Aggregator & BitChord Source Module",
-    version="1.0.0",
+    title="flacjack",
+    description="Fresh, warm stacks of lossless audio on demand & BitChord Source Module",
+    version="2.0.0",
     lifespan=lifespan,
 )
 
@@ -371,8 +371,8 @@ async def root_index(request: Request):
         return HTMLResponse(content=render_dashboard_html(base_url, version="2.0.0"))
 
     return {
-        "service": "hifi-bridge",
-        "description": "Self-Hosted Hi-Fi Lossless Aggregator & BitChord Source Module",
+        "service": "flacjack",
+        "description": "Fresh, warm stacks of lossless audio on demand & BitChord Source Module 🥞",
         "version": "2.0.0",
         "bitchord_module": f"{base_url}/bitchord-module.json",
         "manifest": f"{base_url}/manifest.json",
