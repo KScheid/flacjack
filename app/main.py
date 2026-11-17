@@ -9,9 +9,10 @@ import hmac
 import ipaddress
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import List, Optional, Set, Union
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -34,7 +35,7 @@ from app.models import (
     QualityTier,
 )
 from app.prefetcher import prefetcher
-from app.stream_resolver import stream_resolver
+from app.stream_resolver import is_snowflake_id, sanitize_track_id, stream_resolver
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,45 +47,172 @@ logger = logging.getLogger("hifi-bridge")
 START_TIME = time.time()
 DEFAULT_QUALITY = os.environ.get("DEFAULT_QUALITY", QualityTier.HI_RES_LOSSLESS.value)
 SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "").strip()
+
+# The token becomes part of every URL, so it has to be URL-safe. Anything else
+# would silently break routing or the baseUrl handed to BitChord.
+if SECRET_TOKEN and not re.fullmatch(r"(?!\.+$)[A-Za-z0-9._~\-]+", SECRET_TOKEN):
+    raise RuntimeError(
+        "SECRET_TOKEN may only contain letters, digits and the characters . _ ~ - "
+        "(for example the output of: openssl rand -hex 24)"
+    )
+
+
+# ── Client IP / LAN detection ────────────────────────────────────────────────
+
+IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
+IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
+
+# Optional: narrow what counts as "LAN", e.g. LAN_CIDRS=192.168.50.0/24,172.17.0.0/16,100.64.0.0/10
+# When set, ONLY these networks (plus loopback) count, so list Tailscale's
+# 100.64.0.0/10 too if you want it. If requests reach this container through a
+# reverse proxy, include the proxy's own address/subnet.
+_LAN_CIDRS_RAW = os.environ.get("LAN_CIDRS", "").strip()
+LAN_CIDRS_CONFIGURED = bool(_LAN_CIDRS_RAW)
+
+
+def _parse_lan_cidrs(raw: str) -> List[IPNetwork]:
+    networks: List[IPNetwork] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            logger.warning(f"Ignoring invalid LAN_CIDRS entry: {part!r}")
+    return networks
+
+
+LAN_NETWORKS = _parse_lan_cidrs(_LAN_CIDRS_RAW)
+
+# Default definition of "LAN" when LAN_CIDRS is not set. Listed explicitly because
+# ipaddress.is_private also covers documentation and reserved ranges.
 TAILSCALE_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+DEFAULT_LAN_NETWORKS: List[IPNetwork] = [
+    TAILSCALE_NETWORK,  # Tailscale tailnet addresses
+] + [
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "fc00::/7",
+        "fe80::/10",
+    )
+]
+
+_FORWARDED_FOR_RE = re.compile(r'for=\s*"?(\[[^\]]+\](?::\d+)?|[^;,"\s]+)', re.IGNORECASE)
+_SINGLE_IP_HEADERS = ("cf-connecting-ip", "true-client-ip", "x-real-ip")
+
+
+def _parse_ip(value: str) -> Optional[IPAddress]:
+    """Parses an IP that may carry brackets or a port. Returns None if it is not an IP."""
+    v = value.strip().strip('"').strip()
+    if not v:
+        return None
+    if v.startswith("["):
+        v = v[1:].split("]", 1)[0]
+    elif v.count(":") == 1:  # IPv4 with port
+        v = v.split(":", 1)[0]
+    try:
+        ip = ipaddress.ip_address(v)
+    except ValueError:
+        return None
+    mapped = getattr(ip, "ipv4_mapped", None)  # ::ffff:1.2.3.4 -> 1.2.3.4
+    return mapped if mapped is not None else ip
+
+
+def _ip_is_lan(ip: IPAddress) -> bool:
+    if ip.is_loopback:
+        return True
+    networks = LAN_NETWORKS if LAN_CIDRS_CONFIGURED else DEFAULT_LAN_NETWORKS
+    return any(ip in net for net in networks)
 
 
 def is_lan_request(request: Request) -> bool:
-    """Returns True only if the request originated from a private LAN, Tailscale, or loopback IP."""
-    cf_ip = request.headers.get("cf-connecting-ip")
-    if cf_ip:
-        client_ip_str = cf_ip.strip()
-    else:
-        xff = request.headers.get("x-forwarded-for")
-        if xff:
-            client_ip_str = xff.split(",")[0].strip()
-        else:
-            client_ip_str = request.client.host if request.client else ""
+    """
+    Returns True only if EVERY hop we know about is a LAN, Tailscale or loopback address:
+    the TCP peer plus every address in the forwarding headers.
 
-    if client_ip_str in ("testclient", "localhost", "127.0.0.1", "::1"):
+    Forwarding headers are client-controlled, so they are never allowed to make a
+    request look more trusted, only less. A spoofed "X-Forwarded-For: 192.168.1.5"
+    sent through a reverse proxy still carries the real public IP that the proxy
+    appended, and that public hop fails the check. Anything unparseable fails closed.
+    """
+    peer = request.client.host if request.client else ""
+    # Starlette's TestClient reports its peer as the literal "testclient". Only the
+    # real connection can carry that value; a header saying "localhost" or
+    # "testclient" is still rejected below because it does not parse as an IP.
+    hops: List[str] = ["127.0.0.1" if peer == "testclient" else peer]
+
+    for header in _SINGLE_IP_HEADERS:
+        hops.extend(v for v in request.headers.getlist(header) if v.strip())
+
+    for value in request.headers.getlist("x-forwarded-for"):
+        hops.extend(part for part in value.split(",") if part.strip())
+
+    for value in request.headers.getlist("forwarded"):
+        hops.extend(_FORWARDED_FOR_RE.findall(value))
+
+    for hop in hops:
+        ip = _parse_ip(hop)
+        if ip is None or not _ip_is_lan(ip):
+            return False
+    return True
+
+
+def _has_valid_token_prefix(path: str) -> bool:
+    """Constant-time check that the path starts with /s/<SECRET_TOKEN>."""
+    if not SECRET_TOKEN or not path.startswith("/s/"):
+        return False
+    candidate = path[3:].split("/", 1)[0]
+    return hmac.compare_digest(candidate.encode("utf-8"), SECRET_TOKEN.encode("utf-8"))
+
+
+class _RedactTokenFilter(logging.Filter):
+    """Keeps the secret token out of the access log (it is part of every request path)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if SECRET_TOKEN:
+            if isinstance(record.msg, str) and SECRET_TOKEN in record.msg:
+                record.msg = record.msg.replace(SECRET_TOKEN, "***")
+            if isinstance(record.args, tuple):
+                record.args = tuple(
+                    a.replace(SECRET_TOKEN, "***") if isinstance(a, str) else a for a in record.args
+                )
         return True
 
-    try:
-        ip = ipaddress.ip_address(client_ip_str)
-        return ip.is_private or ip.is_loopback or (ip in TAILSCALE_NETWORK)
-    except ValueError:
-        return False
+
+logging.getLogger("uvicorn.access").addFilter(_RedactTokenFilter())
+
+
+# ── Base URL reconstruction ──────────────────────────────────────────────────
+
+_HOST_RE = re.compile(r"^(?:[A-Za-z0-9.\-]+|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?$")
+
+
+def _first_header_value(value: Optional[str]) -> str:
+    return value.split(",")[0].strip() if value else ""
 
 
 def get_request_base_url(request: Request, include_secret_prefix: bool = True) -> str:
     """Dynamically reconstructs client-facing base URL including secret prefix when configured."""
-    forwarded_proto = request.headers.get("x-forwarded-proto")
-    forwarded_host = request.headers.get("x-forwarded-host")
-    if forwarded_host:
-        proto = forwarded_proto or "https"
-        origin = f"{proto}://{forwarded_host}"
+    forwarded_proto = _first_header_value(request.headers.get("x-forwarded-proto")).lower()
+    if forwarded_proto not in ("http", "https"):
+        forwarded_proto = ""
+    forwarded_host = _first_header_value(request.headers.get("x-forwarded-host"))
+    host = _first_header_value(request.headers.get("host"))
+
+    # Host headers are client-supplied and end up inside HTML and JSON, so only
+    # accept values that actually look like a hostname[:port].
+    if forwarded_host and _HOST_RE.match(forwarded_host):
+        origin = f"{forwarded_proto or 'https'}://{forwarded_host}"
+    elif host and _HOST_RE.match(host):
+        origin = f"{forwarded_proto or request.url.scheme or 'http'}://{host}"
     else:
-        host = request.headers.get("host")
-        if host:
-            proto = forwarded_proto or request.url.scheme or "http"
-            origin = f"{proto}://{host}"
-        else:
-            origin = str(request.base_url).rstrip("/")
+        server = request.scope.get("server")
+        origin = f"http://{server[0]}:{server[1]}" if server else "http://localhost"
 
     if include_secret_prefix and SECRET_TOKEN:
         return f"{origin}/s/{SECRET_TOKEN}"
@@ -126,6 +254,41 @@ def build_addon_manifest(base_url: str) -> AddonManifest:
     )
 
 
+# ── Background work ──────────────────────────────────────────────────────────
+
+# Strong references: asyncio only keeps weak references to tasks, so an
+# un-referenced fire-and-forget task can be garbage collected mid-flight.
+_background_tasks: Set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _archive_in_background(clean_id: str, stream_url: str, base_url: str) -> None:
+    """Looks up metadata and hands the track to the archiver without delaying playback."""
+    try:
+        direct_url: Optional[str] = stream_url
+        if "/stream/audio/" in stream_url:
+            # Our own proxy URL is not downloadable by the archiver. Only snowflake
+            # IDs have a mirror endpoint that returns audio; for every other ID
+            # <mirror>/track/<id> returns JSON, which must never be archived as audio.
+            # With no direct URL the archiver copies from the local audio cache instead.
+            direct_url = None
+            if is_snowflake_id(clean_id):
+                ranked = mirror_manager.get_ranked_mirrors()
+                if ranked:
+                    direct_url = f"{ranked[0]}/track/{clean_id}"
+
+        track = await stream_resolver.get_track(clean_id, base_url)
+        if track:
+            archiver.trigger_archive(track, clean_id, direct_url)
+    except Exception as e:
+        logger.warning(f"Archive trigger failed for track {clean_id}: {e}")
+
+
 async def _cache_cleanup_loop():
     """Background task that evicts expired cache entries every 30 minutes."""
     while True:
@@ -146,8 +309,12 @@ async def lifespan(app: FastAPI):
     logger.info("Initializing hifi-bridge microservice...")
     if SECRET_TOKEN:
         logger.info("SECRET_TOKEN is active: external BitChord routes require /s/<SECRET_TOKEN>/...")
+        if len(SECRET_TOKEN) < 16:
+            logger.warning("SECRET_TOKEN is shorter than 16 characters; use a longer random value.")
     else:
         logger.warning("SECRET_TOKEN is not set: BitChord routes are accessible without token prefix.")
+    if LAN_CIDRS_CONFIGURED:
+        logger.info(f"LAN_CIDRS active: {', '.join(str(n) for n in LAN_NETWORKS) or 'loopback only'}")
 
     await db.init_db()
     await mirror_manager.start()
@@ -160,8 +327,11 @@ async def lifespan(app: FastAPI):
         await cleanup_task
     except asyncio.CancelledError:
         pass
+    for task in list(_background_tasks):
+        task.cancel()
     await prefetcher.stop()
     await archiver.shutdown()
+    await stream_resolver.aclose()
     await mirror_manager.stop()
     await db.close()
 
@@ -176,10 +346,11 @@ app = FastAPI(
     openapi_url=None,
 )
 
+# No cookies or HTTP auth are used, so credentials stay off.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -188,7 +359,7 @@ app.add_middleware(
 @app.middleware("http")
 async def security_gate_middleware(request: Request, call_next):
     """
-    1. Allows Docker local /health checks.
+    1. Allows /health (Docker health checks).
     2. Restricts WebUI (/, /dashboard) and admin APIs (/api/*, /mirrors*) to LAN IPs only.
     3. Enforces /s/<SECRET_TOKEN>/ prefix on BitChord & audio routes when SECRET_TOKEN is set.
     """
@@ -207,8 +378,7 @@ async def security_gate_middleware(request: Request, call_next):
 
     # Token-protected BitChord & streaming routes
     if SECRET_TOKEN:
-        expected_prefix = f"/s/{SECRET_TOKEN}"
-        if path == expected_prefix or path.startswith(expected_prefix + "/"):
+        if _has_valid_token_prefix(path):
             return await call_next(request)
         # Allow unprefixed calls only from local LAN for quick testing
         if lan:
@@ -343,19 +513,12 @@ async def resolve_stream(
     request: Request,
     quality: str = Query(DEFAULT_QUALITY, description="Requested quality tier (HI_RES_LOSSLESS, LOSSLESS, HIGH)"),
 ):
-    clean_id = track_id.strip()
+    clean_id = sanitize_track_id(track_id)
     base_url = get_request_base_url(request, include_secret_prefix=True)
     stream_info = await stream_resolver.resolve_stream(clean_id, quality=quality, base_url=base_url)
 
     if archiver.enabled:
-        track = await stream_resolver.get_track(clean_id, base_url)
-        if track:
-            target_url = stream_info.url
-            if "/stream/audio/" in target_url:
-                ranked = mirror_manager.get_ranked_mirrors()
-                if ranked:
-                    target_url = f"{ranked[0]}/track/{clean_id}"
-            archiver.trigger_archive(track, target_url)
+        _spawn_background(_archive_in_background(clean_id, stream_info.url, base_url))
 
     return stream_info
 
@@ -408,11 +571,12 @@ async def root_index(request: Request):
     if "text/html" in accept:
         return HTMLResponse(content=render_dashboard_html(base_url, version="2.0.0"))
 
+    plain_base_url = get_request_base_url(request, include_secret_prefix=False)
     return {
         "service": "flacjack",
         "version": "2.0.0",
         "bitchord_module": f"{base_url}/bitchord-module.json",
         "manifest": f"{base_url}/manifest.json",
-        "dashboard": f"{get_request_base_url(request, include_secret_prefix=False)}/dashboard",
-        "health": f"{get_request_base_url(request, include_secret_prefix=False)}/health",
+        "dashboard": f"{plain_base_url}/dashboard",
+        "health": f"{plain_base_url}/health",
     }
