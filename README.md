@@ -140,6 +140,9 @@ Production-ready, self-hosted Python (FastAPI) microservice bridging public Hi-F
 | `PGID` | `100` | Unraid group ID (`users`). |
 | `DEFAULT_QUALITY` | `HI_RES_LOSSLESS` | Default quality tier (`HI_RES_LOSSLESS`, `LOSSLESS`, `HIGH`). |
 | `PREFETCH_ENABLED` | `true` | Enables background lookahead queue prefetching. |
+| `PROXY_STREAMS` | `true` | Serve playback through the proxy, which re-resolves expired upstream links and resumes dropped connections mid-track. `false` hands clients the raw CDN URL. |
+| `STREAM_RESUME_ATTEMPTS` | `5` | Re-open attempts per upstream outage before a stream is abandoned. |
+| `STREAM_STALL_TIMEOUT` | `20` | Seconds without data from upstream before the connection is resumed. |
 | `PREFETCH_LOOKAHEAD` | `2` | Number of upcoming tracks to prefetch in the background. |
 | `AUDIO_CACHE_DIR` | `/data/audio_cache` | Path for cached audio files on local disk. |
 | `MAX_CACHE_GB` | `10` | Maximum disk space (in GB) before LRU eviction. |

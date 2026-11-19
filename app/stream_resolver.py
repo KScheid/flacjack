@@ -39,6 +39,19 @@ CACHE_TTL_STREAM = int(os.environ.get("CACHE_TTL_STREAM", "3600"))
 # not make a track unplayable for a full hour.
 CACHE_TTL_STREAM_FALLBACK = 60
 MIN_AUDIO_BYTES = 10240
+PROXY_STREAMS = os.environ.get("PROXY_STREAMS", "true").strip().lower() not in ("false", "0", "no", "off")
+# How many times a dropped upstream connection is re-opened (from the byte it
+# stopped at) before the client connection is given up on.
+STREAM_RESUME_ATTEMPTS = max(0, int(os.environ.get("STREAM_RESUME_ATTEMPTS", "5")))
+# Seconds without a single byte from upstream before the connection is treated
+# as dead and resumed. Only counts while we are waiting on upstream, so a
+# player that has paused reading (full buffer) never triggers it.
+STREAM_STALL_TIMEOUT = float(os.environ.get("STREAM_STALL_TIMEOUT", "20"))
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+_CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)")
 
 VALID_QUALITIES = {tier.value for tier in QualityTier}
 
@@ -116,8 +129,11 @@ def _is_audio_url(value: Any) -> bool:
     return host not in _NON_AUDIO_HOSTS
 
 
-def _internal_stream_url(base_url: str, track_id: str) -> str:
-    return f"{base_url.rstrip('/')}/stream/audio/{track_id}.flac" if base_url else f"/stream/audio/{track_id}.flac"
+def _internal_stream_url(base_url: str, track_id: str, quality: Optional[str] = None) -> str:
+    url = f"{base_url.rstrip('/')}/stream/audio/{track_id}.flac" if base_url else f"/stream/audio/{track_id}.flac"
+    if quality and quality != QualityTier.HI_RES_LOSSLESS.value:
+        url += f"?quality={quality}"
+    return url
 
 
 def _build_stream(
@@ -461,16 +477,43 @@ class StreamResolver:
         quality: str = QualityTier.HI_RES_LOSSLESS.value,
         base_url: str = "",
     ) -> AddonStream:
+        """
+        The stream handed to clients. Its URL always points at our own audio
+        proxy, never at the upstream CDN: signed CDN URLs expire and drop
+        connections mid-track, and a client holding one has no way to recover,
+        so it stalls and then skips to the next song. The proxy re-resolves
+        stale URLs and resumes interrupted downloads transparently.
+        Set PROXY_STREAMS=false to hand out the direct upstream URL instead.
+        """
+        clean_id = sanitize_track_id(track_id)
+        quality = normalize_quality(quality)
+        stream_obj = await self.resolve_upstream(clean_id, quality)
+        if PROXY_STREAMS or not stream_obj.url or "/stream/audio/" in stream_obj.url:
+            stream_obj.url = _internal_stream_url(base_url, clean_id, quality)
+        return stream_obj
+
+    async def resolve_upstream(
+        self,
+        track_id: str,
+        quality: str = QualityTier.HI_RES_LOSSLESS.value,
+        *,
+        force_refresh: bool = False,
+    ) -> AddonStream:
+        """
+        Resolves stream metadata plus, when one exists, a direct upstream audio URL.
+        `url` is "" when there is no direct URL (snowflake IDs, failed resolution).
+        `force_refresh` skips the cache, used when a cached URL has gone stale.
+        """
         clean_id = sanitize_track_id(track_id)
         quality = normalize_quality(quality)
 
-        cached = await db.get_cached_stream(clean_id, quality)
-        if cached:
-            stream_obj = AddonStream(**cached)
-            if "/stream/audio/" in stream_obj.url:
-                # Never hand out a base URL remembered from a different client.
-                stream_obj.url = _internal_stream_url(base_url, clean_id)
-            return stream_obj
+        if not force_refresh:
+            cached = await db.get_cached_stream(clean_id, quality)
+            if cached:
+                stream_obj = AddonStream(**cached)
+                if "/stream/audio/" in stream_obj.url:
+                    stream_obj.url = ""  # entry written by an older version
+                return stream_obj
 
         quality_chain = [quality]
         if quality == QualityTier.HI_RES_LOSSLESS.value:
@@ -484,10 +527,7 @@ class StreamResolver:
         if is_snowflake_id(clean_id):
             # Snowflake IDs are served as plain files by <mirror>/track/<id>,
             # which is exactly what our audio proxy fetches.
-            resolved_stream = _build_stream(
-                _internal_stream_url(base_url, clean_id),
-                QualityTier.HI_RES_LOSSLESS.value,
-            )
+            resolved_stream = _build_stream("", QualityTier.HI_RES_LOSSLESS.value)
         else:
             for tier in quality_chain:
                 try:
@@ -501,7 +541,7 @@ class StreamResolver:
                     break
 
         if resolved_stream is None:
-            fallback = _build_stream(_internal_stream_url(base_url, clean_id), quality)
+            fallback = _build_stream("", quality)
             fallback.bitDepth = 16.0
             fallback.sampleRate = 44100.0
             resolved_stream = fallback
@@ -813,40 +853,259 @@ class StreamResolver:
         except Exception:
             pass
 
-    async def _tee_stream(
+    # ── Upstream connections ────────────────────────────────────────────────
+
+    def _get_stream_client(self) -> httpx.AsyncClient:
+        if self._stream_client is None or self._stream_client.is_closed:
+            from app.mirror_manager import VERIFY_TLS
+
+            self._stream_client = httpx.AsyncClient(
+                verify=VERIFY_TLS,
+                follow_redirects=True,
+                # `read` is the longest gap between two chunks before the
+                # connection counts as stalled and gets resumed.
+                timeout=httpx.Timeout(connect=5.0, read=STREAM_STALL_TIMEOUT, write=5.0, pool=30.0),
+                limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+            )
+        return self._stream_client
+
+    @staticmethod
+    def _is_non_audio(content_type: str) -> bool:
+        """HTML parking pages, XML S3 errors and JSON API replies are not audio."""
+        ct = content_type.lower()
+        return ct.startswith("text/") or "html" in ct or "xml" in ct or "json" in ct
+
+    async def _open_upstream(self, url: str, headers: Dict[str, str]) -> Optional[httpx.Response]:
+        """Opens a streaming GET. Returns the response only if it is audio with status 200/206."""
+        client = self._get_stream_client()
+        resp: Optional[httpx.Response] = None
+        try:
+            for attempt in range(2):
+                resp = await client.send(client.build_request("GET", url, headers=headers), stream=True)
+                if resp.status_code == 429 and attempt == 0:
+                    logger.warning(f"Audio upstream {url} returned 429, backing off 2.0s...")
+                    await resp.aclose()
+                    resp = None
+                    await asyncio.sleep(2.0)
+                    continue
+                break
+            if resp is None or resp.status_code not in (200, 206):
+                logger.debug(f"Audio upstream {url} returned status {resp.status_code if resp else '?'}")
+                return None
+            content_type = resp.headers.get("Content-Type", "audio/flac")
+            if self._is_non_audio(content_type):
+                logger.warning(f"Audio proxy: skipping {url} — non-audio content-type '{content_type}'")
+                return None
+            ok, resp = resp, None  # caller owns it now
+            return ok
+        except Exception as e:
+            logger.debug(f"Audio upstream {url} failed: {e}")
+            return None
+        finally:
+            if resp is not None:
+                try:
+                    await resp.aclose()
+                except Exception:
+                    pass
+
+    async def _candidate_urls(self, clean_id: str, quality: str, *, refresh: bool) -> List[str]:
+        """
+        Where the audio for a track can be fetched. Snowflake IDs are plain files
+        at <mirror>/track/<id>; every other ID needs a resolved direct URL, since
+        for those <mirror>/track/<id> is a JSON API reply, not audio.
+        """
+        if is_snowflake_id(clean_id):
+            return list(dict.fromkeys(f"{m}/track/{clean_id}" for m in mirror_manager.get_ranked_mirrors()))
+        try:
+            resolved = await self.resolve_upstream(clean_id, quality, force_refresh=refresh)
+        except Exception as e:
+            logger.debug(f"Stream resolution failed for {clean_id}: {e}")
+            return []
+        return [resolved.url] if resolved.url.startswith("http") else []
+
+    async def _open_first_available(
+        self,
+        clean_id: str,
+        quality: str,
+        headers: Dict[str, str],
+    ) -> Tuple[Optional[httpx.Response], str]:
+        """
+        Tries the cached sources first, then re-resolves once. A cached direct URL
+        is a signed CDN link that can expire long before the cache entry does.
+        """
+        tried: Set[str] = set()
+        for refresh in (False, True):
+            if refresh and is_snowflake_id(clean_id):
+                break
+            for url in await self._candidate_urls(clean_id, quality, refresh=refresh):
+                if url in tried:
+                    continue
+                tried.add(url)
+                resp = await self._open_upstream(url, headers)
+                if resp is not None:
+                    return resp, url
+            if not refresh and tried:
+                logger.info(f"[STREAM] Cached sources for {clean_id} failed, re-resolving")
+        return None, ""
+
+    @staticmethod
+    def _response_span(resp: httpx.Response) -> Tuple[int, Optional[int], Optional[int]]:
+        """(first byte offset, last byte offset or None, total size or None) of a response body."""
+        if resp.status_code == 206:
+            match = _CONTENT_RANGE_RE.match(resp.headers.get("Content-Range", "").strip())
+            if match:
+                total = int(match.group(3)) if match.group(3).isdigit() else None
+                return int(match.group(1)), int(match.group(2)), total
+            return 0, None, None
+        length = resp.headers.get("Content-Length", "")
+        if length.isdigit():
+            return 0, int(length) - 1, int(length)
+        return 0, None, None
+
+    async def _reopen_at(
+        self,
+        clean_id: str,
+        quality: str,
+        base_headers: Dict[str, str],
+        last_url: str,
+        position: int,
+        end: Optional[int],
+        total: Optional[int],
+        refresh: bool,
+    ) -> Tuple[Optional[httpx.Response], str, int]:
+        """
+        Re-opens the track at byte `position`. Returns (response, url, bytes to
+        discard from the start of the response). A different source is only
+        accepted when it is provably the same file (same total size), because
+        splicing bytes from another quality tier would corrupt the audio.
+        """
+        headers = dict(base_headers)
+        headers["Range"] = f"bytes={position}-{'' if end is None else end}"
+
+        urls = [last_url] if last_url else []
+        if refresh:
+            urls += await self._candidate_urls(clean_id, quality, refresh=True)
+        for url in dict.fromkeys(urls):
+            resp = await self._open_upstream(url, headers)
+            if resp is None:
+                continue
+            first, _, resp_total = self._response_span(resp)
+            same_file = url == last_url or (total is not None and resp_total == total)
+            if same_file and resp.status_code == 206 and first <= position:
+                return resp, url, position - first
+            if same_file and resp.status_code == 200:
+                return resp, url, position  # range ignored: whole file again
+            await resp.aclose()
+        return None, last_url, 0
+
+    async def _proxy_body(
         self,
         upstream_resp: httpx.Response,
-        track_id: str,
+        source_url: str,
+        clean_id: str,
+        quality: str,
+        base_headers: Dict[str, str],
         tee_to_cache: bool,
         expected_total_bytes: Optional[int],
     ) -> AsyncIterator[bytes]:
-        """Streams upstream audio to the client, optionally writing a copy to the disk cache."""
+        """
+        Streams upstream audio to the client, optionally writing a copy to the disk cache.
+
+        If upstream drops, stalls or ends early, the request is re-opened from the
+        exact byte that was reached, so the client sees one continuous response
+        instead of a broken one. Without this, a player stalls on the broken
+        connection, retries, and when that retry also fails skips the track.
+        """
         handle = None
         temp_path = ""
         bytes_written = 0
         completed_cleanly = False
+        current: Optional[httpx.Response] = upstream_resp
+        position, end, total = self._response_span(upstream_resp)
+        skip = 0
+        attempts = 0
+        resumed_at = position
 
         if tee_to_cache:
-            temp_path = os.path.join(prefetcher.cache_dir, f".tmp_proxy_{track_id}_{uuid.uuid4().hex[:8]}")
+            temp_path = os.path.join(prefetcher.cache_dir, f".tmp_proxy_{clean_id}_{uuid.uuid4().hex[:8]}")
             try:
                 handle = open(temp_path, "wb")
             except OSError as e:
                 # A cache problem must never stop playback.
-                logger.warning(f"[CACHE] Cannot open cache file for {track_id}: {e}")
+                logger.warning(f"[CACHE] Cannot open cache file for {clean_id}: {e}")
                 handle = None
 
         try:
-            async for chunk in upstream_resp.aiter_bytes(chunk_size=65536):
-                if handle is not None:
-                    try:
-                        await asyncio.to_thread(handle.write, chunk)
-                        bytes_written += len(chunk)
-                    except OSError as e:
-                        logger.warning(f"[CACHE] Disk write failed for {track_id}, caching disabled: {e}")
-                        self._finalize_cache_file(handle, temp_path, track_id, complete=False)
-                        handle = None
-                yield chunk
-            completed_cleanly = True
+            while True:
+                error: Optional[BaseException] = None
+                try:
+                    async for chunk in current.aiter_bytes(chunk_size=65536):
+                        if skip:
+                            if len(chunk) <= skip:
+                                skip -= len(chunk)
+                                continue
+                            chunk = chunk[skip:]
+                            skip = 0
+                        if end is not None:
+                            chunk = chunk[: max(0, end + 1 - position)]
+                        if not chunk:
+                            break
+                        if handle is not None:
+                            try:
+                                await asyncio.to_thread(handle.write, chunk)
+                                bytes_written += len(chunk)
+                            except OSError as e:
+                                logger.warning(f"[CACHE] Disk write failed for {clean_id}, caching disabled: {e}")
+                                self._finalize_cache_file(handle, temp_path, clean_id, complete=False)
+                                handle = None
+                        position += len(chunk)
+                        yield chunk
+                        if end is not None and position > end:
+                            break
+                except httpx.HTTPError as e:
+                    error = e
+
+                if end is not None and position > end:
+                    completed_cleanly = True
+                    break
+                if error is None and end is None:
+                    completed_cleanly = True  # no length to check against
+                    break
+                reason = error or "upstream closed the connection early"
+
+                # Retries are budgeted per outage: a resume that delivered real
+                # progress resets the count, so a long track with a few separate
+                # hiccups is not given up on.
+                if position - resumed_at >= 256 * 1024:
+                    attempts = 0
+
+                old, current = current, None
+                try:
+                    await old.aclose()
+                except Exception:
+                    pass
+
+                while current is None:
+                    if attempts >= STREAM_RESUME_ATTEMPTS:
+                        logger.error(
+                            f"[STREAM] Giving up on {clean_id} at byte {position}"
+                            f"{f'/{total}' if total else ''} after {attempts} resume attempts ({reason})"
+                        )
+                        raise RuntimeError(f"Upstream audio for {clean_id} could not be resumed")
+                    attempts += 1
+                    logger.warning(
+                        f"[STREAM] Upstream for {clean_id} interrupted at byte {position}"
+                        f"{f'/{total}' if total else ''} ({reason!r}); "
+                        f"resuming (attempt {attempts}/{STREAM_RESUME_ATTEMPTS})"
+                    )
+                    await asyncio.sleep(min(0.5 * (2 ** (attempts - 1)), 4.0))
+                    current, source_url, skip = await self._reopen_at(
+                        clean_id, quality, base_headers, source_url, position, end, total,
+                        refresh=attempts > 1,
+                    )
+                    reason = "re-open failed"
+                resumed_at = position
+                logger.info(f"[STREAM] Resumed {clean_id} at byte {position}")
         finally:
             # File cleanup first and without awaiting: if the client disconnected,
             # this task may be cancelled and any await here could be interrupted.
@@ -856,8 +1115,9 @@ class StreamResolver:
                     and bytes_written > MIN_AUDIO_BYTES
                     and (expected_total_bytes is None or bytes_written >= expected_total_bytes)
                 )
-                self._finalize_cache_file(handle, temp_path, track_id, complete)
-            await upstream_resp.aclose()
+                self._finalize_cache_file(handle, temp_path, clean_id, complete)
+            if current is not None:
+                await current.aclose()
 
     async def stream_audio_proxy(
         self,
@@ -865,6 +1125,7 @@ class StreamResolver:
         request: Request,
     ) -> Response:
         clean_id = sanitize_track_id(track_id)
+        quality = normalize_quality(request.query_params.get("quality"))
         track_meta = await db.get_cached_track(clean_id)
 
         # ── 1. Check local audio cache on disk (CACHE HIT) ────────────────────
@@ -888,123 +1149,75 @@ class StreamResolver:
         self._spawn(prefetcher.queue_upcoming_from_context(clean_id))
 
         # ── 2. Stream from upstream mirror (CACHE MISS) ───────────────────────
-        if self._stream_client is None or self._stream_client.is_closed:
-            from app.mirror_manager import VERIFY_TLS
-
-            self._stream_client = httpx.AsyncClient(
-                verify=VERIFY_TLS,
-                follow_redirects=True,
-                timeout=httpx.Timeout(connect=5.0, read=120.0, write=5.0, pool=30.0),
-                limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
-            )
-        client = self._stream_client
-
-        candidate_urls: List[str] = []
-        if not is_snowflake_id(clean_id):
-            resolved = await self.resolve_stream(clean_id, QualityTier.HI_RES_LOSSLESS.value)
-            if resolved.url and resolved.url.startswith("http") and "/stream/audio/" not in resolved.url:
-                candidate_urls.append(resolved.url)
-        for mirror_url in mirror_manager.get_ranked_mirrors():
-            candidate_urls.append(f"{mirror_url}/track/{clean_id}")
-        candidate_urls = list(dict.fromkeys(candidate_urls))
-
-        forward_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        base_headers = {
+            "User-Agent": _UA,
             "Accept": "*/*",
             # Byte counts and Content-Length are forwarded as-is, so the body
             # must not be transparently decompressed on the way through.
             "Accept-Encoding": "identity",
         }
+        forward_headers = dict(base_headers)
         range_header = request.headers.get("range")
         if range_header:
             forward_headers["Range"] = range_header
         elif request.method == "HEAD":
             forward_headers["Range"] = "bytes=0-0"
 
-        for target_url in candidate_urls:
-            # Set back to None once the response is handed to the streaming body;
-            # until then the `finally` below guarantees the connection is released.
-            upstream_resp: Optional[httpx.Response] = None
-            try:
-                upstream_resp = await client.send(
-                    client.build_request("GET", target_url, headers=forward_headers), stream=True
-                )
+        upstream_resp, source_url = await self._open_first_available(clean_id, quality, forward_headers)
+        if upstream_resp is None:
+            raise HTTPException(status_code=502, detail="All upstream audio sources failed")
 
-                if upstream_resp.status_code == 429:
-                    logger.warning(f"Audio proxy candidate {target_url} returned 429, backing off 2.0s...")
+        handed_off = False
+        try:
+            status_code = upstream_resp.status_code
+            audio_content_type = upstream_resp.headers.get("Content-Type", "audio/flac")
+            content_type = audio_content_type.lower()
+
+            response_headers = {
+                "Content-Type": audio_content_type,
+                "Accept-Ranges": "bytes",
+                "Cache-Control": "public, max-age=31536000, immutable",
+                "X-HiFi-Cache": "MISS",
+            }
+            if "Content-Length" in upstream_resp.headers:
+                response_headers["Content-Length"] = upstream_resp.headers["Content-Length"]
+            if "Content-Range" in upstream_resp.headers:
+                response_headers["Content-Range"] = upstream_resp.headers["Content-Range"]
+
+            ext = ".m4a" if ("mp4" in content_type or "m4a" in content_type or "aac" in content_type) else ".flac"
+            disposition = self._content_disposition(track_meta, clean_id, ext)
+            if disposition:
+                response_headers["Content-Disposition"] = disposition
+
+            if request.method == "HEAD":
+                head_status = status_code
+                size_unknown = False
+                if not range_header and status_code == 206:
+                    # We probed with bytes=0-0; report the full size, not 1 byte.
+                    total_match = re.search(r"/(\d+)\s*$", response_headers.pop("Content-Range", ""))
+                    if total_match:
+                        response_headers["Content-Length"] = total_match.group(1)
+                    else:
+                        response_headers.pop("Content-Length", None)
+                        size_unknown = True
+                    head_status = 200
+                head_response = Response(status_code=head_status, headers=response_headers)
+                if size_unknown and "content-length" in head_response.headers:
+                    del head_response.headers["content-length"]
+                return head_response
+
+            tee_to_cache, expected_total_bytes = self._plan_cache_tee(upstream_resp, range_header)
+            body = self._proxy_body(
+                upstream_resp, source_url, clean_id, quality, base_headers, tee_to_cache, expected_total_bytes
+            )
+            handed_off = True  # the streaming body now owns and closes the response
+            return StreamingResponse(body, status_code=status_code, headers=response_headers)
+        finally:
+            if not handed_off:
+                try:
                     await upstream_resp.aclose()
-                    upstream_resp = None
-                    await asyncio.sleep(2.0)
-                    upstream_resp = await client.send(
-                        client.build_request("GET", target_url, headers=forward_headers), stream=True
-                    )
-
-                status_code = upstream_resp.status_code
-                if status_code not in (200, 206):
-                    logger.debug(f"Audio proxy candidate {target_url} returned status {status_code}")
-                    continue
-
-                audio_content_type = upstream_resp.headers.get("Content-Type", "audio/flac")
-                content_type = audio_content_type.lower()
-                # HTML parking pages, XML S3 errors and JSON API replies are not audio.
-                if (
-                    content_type.startswith("text/")
-                    or "html" in content_type
-                    or "xml" in content_type
-                    or "json" in content_type
-                ):
-                    logger.warning(f"Audio proxy: Skipping {target_url} — non-audio content-type '{content_type}'")
-                    continue
-
-                response_headers = {
-                    "Content-Type": audio_content_type,
-                    "Accept-Ranges": "bytes",
-                    "Cache-Control": "public, max-age=31536000, immutable",
-                    "X-HiFi-Cache": "MISS",
-                }
-                if "Content-Length" in upstream_resp.headers:
-                    response_headers["Content-Length"] = upstream_resp.headers["Content-Length"]
-                if "Content-Range" in upstream_resp.headers:
-                    response_headers["Content-Range"] = upstream_resp.headers["Content-Range"]
-
-                ext = ".m4a" if ("mp4" in content_type or "m4a" in content_type or "aac" in content_type) else ".flac"
-                disposition = self._content_disposition(track_meta, clean_id, ext)
-                if disposition:
-                    response_headers["Content-Disposition"] = disposition
-
-                if request.method == "HEAD":
-                    head_status = status_code
-                    size_unknown = False
-                    if not range_header and status_code == 206:
-                        # We probed with bytes=0-0; report the full size, not 1 byte.
-                        total_match = re.search(r"/(\d+)\s*$", response_headers.pop("Content-Range", ""))
-                        if total_match:
-                            response_headers["Content-Length"] = total_match.group(1)
-                        else:
-                            response_headers.pop("Content-Length", None)
-                            size_unknown = True
-                        head_status = 200
-                    head_response = Response(status_code=head_status, headers=response_headers)
-                    if size_unknown and "content-length" in head_response.headers:
-                        del head_response.headers["content-length"]
-                    return head_response
-
-                tee_to_cache, expected_total_bytes = self._plan_cache_tee(upstream_resp, range_header)
-                body = self._tee_stream(upstream_resp, clean_id, tee_to_cache, expected_total_bytes)
-                upstream_resp = None  # the streaming body now owns and closes it
-                return StreamingResponse(body, status_code=status_code, headers=response_headers)
-
-            except Exception as e:
-                logger.debug(f"Audio proxy attempt failed for {target_url}: {e}")
-                continue
-            finally:
-                if upstream_resp is not None:
-                    try:
-                        await upstream_resp.aclose()
-                    except Exception:
-                        pass
-
-        raise HTTPException(status_code=502, detail="All upstream audio sources failed")
+                except Exception:
+                    pass
 
     # ── Album Details Lookup ─────────────────────────────────────────────────
 

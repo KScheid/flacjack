@@ -267,20 +267,22 @@ def _spawn_background(coro) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
-async def _archive_in_background(clean_id: str, stream_url: str, base_url: str) -> None:
+async def _archive_in_background(clean_id: str, quality: str, base_url: str) -> None:
     """Looks up metadata and hands the track to the archiver without delaying playback."""
     try:
-        direct_url: Optional[str] = stream_url
-        if "/stream/audio/" in stream_url:
-            # Our own proxy URL is not downloadable by the archiver. Only snowflake
-            # IDs have a mirror endpoint that returns audio; for every other ID
-            # <mirror>/track/<id> returns JSON, which must never be archived as audio.
-            # With no direct URL the archiver copies from the local audio cache instead.
-            direct_url = None
-            if is_snowflake_id(clean_id):
-                ranked = mirror_manager.get_ranked_mirrors()
-                if ranked:
-                    direct_url = f"{ranked[0]}/track/{clean_id}"
+        # The URL handed to the client is our own proxy, which the archiver cannot
+        # download from. Only snowflake IDs have a mirror endpoint that returns
+        # audio; for every other ID <mirror>/track/<id> returns JSON, which must
+        # never be archived as audio. With no direct URL the archiver copies from
+        # the local audio cache instead.
+        direct_url: Optional[str] = None
+        if is_snowflake_id(clean_id):
+            ranked = mirror_manager.get_ranked_mirrors()
+            if ranked:
+                direct_url = f"{ranked[0]}/track/{clean_id}"
+        else:
+            upstream = await stream_resolver.resolve_upstream(clean_id, quality)
+            direct_url = upstream.url or None
 
         track = await stream_resolver.get_track(clean_id, base_url)
         if track:
@@ -518,7 +520,7 @@ async def resolve_stream(
     stream_info = await stream_resolver.resolve_stream(clean_id, quality=quality, base_url=base_url)
 
     if archiver.enabled:
-        _spawn_background(_archive_in_background(clean_id, stream_info.url, base_url))
+        _spawn_background(_archive_in_background(clean_id, quality, base_url))
 
     return stream_info
 
