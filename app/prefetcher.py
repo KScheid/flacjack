@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Set
 import httpx
 
 from app.database import db
+from app.flac_check import check_flac_file
 from app.models import AddonTrack, QualityTier
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,8 @@ class PrefetchManager:
         self._stream_client: Optional[httpx.AsyncClient] = None
         self._total_cache_hits = 0
         self._total_requests = 0
+        # (path, size, mtime) of cached files already checked for truncation.
+        self._verified: Set[tuple] = set()
 
         os.makedirs(self.cache_dir, exist_ok=True)
         logger.info(
@@ -92,6 +95,8 @@ class PrefetchManager:
             if not real_path.startswith(real_cache_dir):
                 return None
             if os.path.isfile(real_path) and os.path.getsize(real_path) > 10240:
+                if not self._verify_cached_file(real_path):
+                    return None
                 # Update atime for LRU tracking
                 try:
                     os.utime(real_path, None)
@@ -99,6 +104,34 @@ class PrefetchManager:
                     pass
                 return real_path
         return None
+
+    def _verify_cached_file(self, path: str) -> bool:
+        """
+        Checks a cached FLAC once for truncation and deletes it if it is cut short.
+        Older versions could cache partial downloads; a partial file makes the
+        player stall a few seconds in, fail to seek and skip, on every play.
+        """
+        try:
+            st = os.stat(path)
+        except OSError:
+            return False
+        key = (path, st.st_size, st.st_mtime_ns)
+        if key in self._verified:
+            return True
+        if path.endswith(".flac") and check_flac_file(path) is False:
+            logger.warning(
+                f"[CACHE] Deleting truncated cached file {os.path.basename(path)} "
+                f"({st.st_size // 1024} KB); it will be downloaded again"
+            )
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return False
+        if len(self._verified) > 5000:
+            self._verified.clear()
+        self._verified.add(key)
+        return True
 
     def record_request(self, is_hit: bool):
         """Tracks cache hit/miss statistics."""
@@ -356,6 +389,9 @@ class PrefetchManager:
                 with open(temp_path, "rb") as f:
                     header = f.read(16)
                 if header.startswith(b"fLaC"):
+                    if check_flac_file(temp_path) is False:
+                        os.remove(temp_path)
+                        return None
                     ext = ".flac"
                 elif header[4:8] == b"ftyp":
                     ext = ".m4a"
@@ -373,7 +409,7 @@ class PrefetchManager:
 
             final_path = await asyncio.to_thread(_finalize_prefetch)
             if final_path is None:
-                logger.warning(f"[PREFETCH] Not caching {clean_id}: unrecognised audio container")
+                logger.warning(f"[PREFETCH] Not caching {clean_id}: truncated download or unrecognised container")
                 return
             size_mb = round(os.path.getsize(final_path) / (1024 * 1024), 2)
             logger.info(f"[PREFETCH] Successfully pre-cached track {clean_id} ({size_mb} MB) -> {final_path}")

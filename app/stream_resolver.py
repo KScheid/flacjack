@@ -22,6 +22,7 @@ from fastapi import HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from app.database import db
+from app.flac_check import HEAD_BYTES, TAIL_BYTES, check_flac_bytes, check_flac_file
 from app.mirror_manager import mirror_manager
 from app.prefetcher import prefetcher
 from app.models import (
@@ -63,7 +64,7 @@ VALID_QUALITIES = {tier.value for tier in QualityTier}
 
 _ID_RE = re.compile(r"[A-Za-z0-9_\-]{1,64}")
 _SNOWFLAKE_RE = re.compile(r"\d{17,20}")
-_RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+_RANGE_RE = re.compile(r"\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*")
 # Track-info payloads carry a "url" that points at a web page, not at audio.
 _NON_AUDIO_HOSTS = {"tidal.com", "www.tidal.com", "listen.tidal.com"}
 
@@ -217,6 +218,8 @@ class StreamResolver:
         # serving that offset from a different file (another quality tier, a
         # re-encoded copy) hands the decoder garbage and it fails to seek.
         self._source_pins: Dict[str, Tuple[str, int, float]] = {}
+        # track_id -> size of the file most recently served for it, from any source.
+        self._served_sizes: Dict[str, int] = {}
 
     async def aclose(self) -> None:
         """Cancels background work and closes the upstream audio client."""
@@ -743,8 +746,10 @@ class StreamResolver:
         """
         if not range_header:
             return None
-        match = _RANGE_RE.fullmatch(range_header.strip())
+        # Multi-range requests are answered with their first range only.
+        match = _RANGE_RE.fullmatch(range_header.split(",")[0])
         if not match or (not match.group(1) and not match.group(2)):
+            logger.warning(f"[RANGE] Unsupported Range header {range_header!r}; sending the whole file")
             return None
 
         if match.group(1):
@@ -756,6 +761,7 @@ class StreamResolver:
             end = file_size - 1
 
         if start >= file_size or end < start:
+            logger.warning(f"[RANGE] {range_header!r} is outside the file ({file_size} bytes) -> 416")
             raise HTTPException(
                 status_code=416,
                 detail="Requested range not satisfiable",
@@ -852,6 +858,13 @@ class StreamResolver:
                     ext = ".m4a"
                 else:
                     ext = None  # not audio we recognise: never let it into the cache
+                if ext == ".flac" and check_flac_file(temp_path) is False:
+                    logger.warning(
+                        f"[CACHE] Not caching {track_id}: the FLAC ends before its last frame "
+                        f"(truncated download, {os.path.getsize(temp_path) // 1024} KB)"
+                    )
+                    ext = None
+                    complete = False
                 if ext:
                     final_path = os.path.join(prefetcher.cache_dir, f"{track_id}{ext}")
                     os.replace(temp_path, final_path)
@@ -868,7 +881,8 @@ class StreamResolver:
                         except RuntimeError:
                             pass
                     return
-                logger.warning(f"[CACHE] Not caching {track_id}: unrecognised audio container")
+                elif complete:
+                    logger.warning(f"[CACHE] Not caching {track_id}: unrecognised audio container")
         except Exception as e:
             logger.warning(f"[CACHE] Could not finalize cache file for {track_id}: {e}")
         try:
@@ -899,8 +913,13 @@ class StreamResolver:
         ct = content_type.lower()
         return ct.startswith("text/") or "html" in ct or "xml" in ct or "json" in ct
 
-    async def _open_upstream(self, url: str, headers: Dict[str, str]) -> Optional[httpx.Response]:
-        """Opens a streaming GET. Returns the response only if it is audio with status 200/206."""
+    async def _open_upstream(
+        self, url: str, headers: Dict[str, str], statuses: Optional[List[int]] = None
+    ) -> Optional[httpx.Response]:
+        """
+        Opens a streaming GET. Returns the response only if it is audio with status
+        200/206. Final status codes are appended to `statuses` when given.
+        """
         client = self._get_stream_client()
         resp: Optional[httpx.Response] = None
         try:
@@ -913,6 +932,8 @@ class StreamResolver:
                     await asyncio.sleep(2.0)
                     continue
                 break
+            if resp is not None and statuses is not None:
+                statuses.append(resp.status_code)
             if resp is None or resp.status_code not in (200, 206):
                 logger.debug(f"Audio upstream {url} returned status {resp.status_code if resp else '?'}")
                 return None
@@ -1009,11 +1030,14 @@ class StreamResolver:
         if not url or total is None:
             return
         now = time.monotonic()
+        self._served_sizes[clean_id] = total
         self._source_pins[clean_id] = (url, total, now)
         if len(self._source_pins) > 500:
             cutoff = now - 6 * 3600
             for key in [k for k, v in self._source_pins.items() if v[2] < cutoff]:
                 del self._source_pins[key]
+        if len(self._served_sizes) > 2000:
+            self._served_sizes.clear()
 
     @staticmethod
     def _response_span(resp: httpx.Response) -> Tuple[int, Optional[int], Optional[int]]:
@@ -1039,6 +1063,7 @@ class StreamResolver:
         end: Optional[int],
         total: Optional[int],
         refresh: bool,
+        statuses: Optional[List[int]] = None,
     ) -> Tuple[Optional[httpx.Response], str, int]:
         """
         Re-opens the track at byte `position`. Returns (response, url, bytes to
@@ -1053,7 +1078,7 @@ class StreamResolver:
         if refresh:
             urls += await self._candidate_urls(clean_id, quality, refresh=True)
         for url in dict.fromkeys(urls):
-            resp = await self._open_upstream(url, headers)
+            resp = await self._open_upstream(url, headers, statuses if url == last_url else None)
             if resp is None:
                 continue
             first, _, resp_total = self._response_span(resp)
@@ -1098,6 +1123,11 @@ class StreamResolver:
             skip, position, end = start_at, start_at, stop_at
         attempts = 0
         resumed_at = position
+        # When upstream never says how big the file is, a clean end is not proof
+        # that it is complete. Keep the start and the most recent bytes so the
+        # FLAC structure can be checked when the stream ends.
+        head = bytearray() if position == 0 and end is None else None
+        tail = bytearray()
 
         if tee_to_cache:
             temp_path = os.path.join(prefetcher.cache_dir, f".tmp_proxy_{clean_id}_{uuid.uuid4().hex[:8]}")
@@ -1132,6 +1162,12 @@ class StreamResolver:
                                 self._finalize_cache_file(handle, temp_path, clean_id, complete=False)
                                 handle = None
                         position += len(chunk)
+                        if head is not None:
+                            if len(head) < HEAD_BYTES:
+                                head += chunk[: HEAD_BYTES - len(head)]
+                            tail += chunk
+                            if len(tail) > TAIL_BYTES:
+                                del tail[: len(tail) - TAIL_BYTES]
                         yield chunk
                         if end is not None and position > end:
                             break
@@ -1142,9 +1178,13 @@ class StreamResolver:
                     completed_cleanly = True
                     break
                 if error is None and end is None:
-                    completed_cleanly = True  # no length to check against
-                    break
-                reason = error or "upstream closed the connection early"
+                    truncated = head is not None and check_flac_bytes(bytes(head), bytes(tail)) is False
+                    if not truncated:
+                        completed_cleanly = True  # nothing says it is short
+                        break
+                    reason = "FLAC ended before its last frame (upstream stopped early)"
+                else:
+                    reason = error or "upstream closed the connection early"
 
                 # Retries are budgeted per outage: a resume that delivered real
                 # progress resets the count, so a long track with a few separate
@@ -1172,11 +1212,21 @@ class StreamResolver:
                         f"resuming (attempt {attempts}/{STREAM_RESUME_ATTEMPTS})"
                     )
                     await asyncio.sleep(min(0.5 * (2 ** (attempts - 1)), 4.0))
+                    statuses: List[int] = []
                     current, source_url, skip = await self._reopen_at(
                         clean_id, quality, base_headers, source_url, position, end, total,
-                        refresh=attempts > 1,
+                        refresh=attempts > 1, statuses=statuses,
                     )
+                    if current is None and 416 in statuses and end is None:
+                        # Asked for bytes past the end: the stream really did end.
+                        if head is None or check_flac_bytes(bytes(head), bytes(tail)) is not False:
+                            completed_cleanly = True
+                        else:
+                            logger.warning(f"[STREAM] {clean_id}: upstream's file is truncated at byte {position}")
+                        break
                     reason = "re-open failed"
+                if current is None:
+                    break
                 resumed_at = position
                 logger.info(f"[STREAM] Resumed {clean_id} at byte {position}")
         finally:
@@ -1200,20 +1250,42 @@ class StreamResolver:
         clean_id = sanitize_track_id(track_id)
         quality = normalize_quality(request.query_params.get("quality"))
         track_meta = await db.get_cached_track(clean_id)
+        range_header = request.headers.get("range")
+        # A Range that does not start at 0 is a seek or a reconnect mid-track: it
+        # must be answered from the same file the player already has.
+        mid_track = bool(range_header) and range_header.replace(" ", "") != "bytes=0-"
+        served_size = self._served_sizes.get(clean_id)
 
         # ── 1. Check local audio cache on disk (CACHE HIT) ────────────────────
         cached_path = prefetcher.get_cached_track_path(clean_id)
         if cached_path:
             try:
+                cached_size = os.path.getsize(cached_path)
+                if mid_track and served_size is not None and served_size != cached_size:
+                    # The player is mid-way through a different copy of this track
+                    # (another mirror or tier). Byte offsets into it mean nothing
+                    # in the cached file, so keep serving the copy it started on.
+                    logger.warning(
+                        f"[CACHE] {clean_id}: player is mid-track in a {served_size}-byte file but the "
+                        f"cached copy is {cached_size} bytes; serving the original source instead"
+                    )
+                    raise OSError("cached copy differs from the file being played")
                 ext = os.path.splitext(cached_path)[1] or ".flac"
                 response = self._serve_local_audio_file(
                     cached_path, request, self._content_disposition(track_meta, clean_id, ext)
                 )
             except OSError as e:
-                # File vanished between the check and the read (pruned / cleared)
-                logger.warning(f"[CACHE] Cached file for {clean_id} unreadable, using upstream: {e}")
+                if "differs" not in str(e):
+                    # File vanished between the check and the read (pruned / cleared)
+                    logger.warning(f"[CACHE] Cached file for {clean_id} unreadable, using upstream: {e}")
             else:
-                logger.info(f"[CACHE HIT] Serving track {clean_id} directly from local disk ({cached_path})")
+                if not mid_track:
+                    self._served_sizes[clean_id] = cached_size
+                logger.info(
+                    f"[CACHE HIT] {request.method} {clean_id} range={range_header or '-'} -> "
+                    f"{response.status_code} {response.headers.get('content-range') or response.headers.get('content-length', '')}"
+                    f" (file {cached_size} bytes)"
+                )
                 prefetcher.record_request(is_hit=True)
                 self._spawn(prefetcher.queue_upcoming_from_context(clean_id))
                 return response
@@ -1230,26 +1302,27 @@ class StreamResolver:
             "Accept-Encoding": "identity",
         }
         forward_headers = dict(base_headers)
-        range_header = request.headers.get("range")
         if range_header:
             forward_headers["Range"] = range_header
         elif request.method == "HEAD":
             forward_headers["Range"] = "bytes=0-0"
 
-        # A Range that does not start at 0 is a seek or a reconnect mid-track: it
-        # must be answered from the same file the player already has.
         pin = self._source_pins.get(clean_id)
-        mid_track = bool(range_header) and range_header.replace(" ", "") != "bytes=0-"
         upstream_resp, source_url = await self._open_first_available(
             clean_id,
             quality,
             forward_headers,
-            expected_total=pin[1] if (pin and mid_track) else None,
+            expected_total=served_size if mid_track else None,
             pinned_url=pin[0] if pin else "",
         )
         if upstream_resp is None:
+            logger.warning(f"[STREAM] {request.method} {clean_id} range={range_header or '-'} -> 502 (no source)")
             raise HTTPException(status_code=502, detail="All upstream audio sources failed")
         self._pin_source(clean_id, source_url, self._response_span(upstream_resp)[2])
+        logger.info(
+            f"[STREAM] {request.method} {clean_id} range={range_header or '-'} -> upstream "
+            f"{upstream_resp.status_code} {upstream_resp.headers.get('content-range') or upstream_resp.headers.get('content-length', '')}"
+        )
 
         handed_off = False
         try:
