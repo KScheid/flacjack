@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import time
+from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 from typing import List, Optional, Set, Union
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
@@ -55,6 +56,29 @@ if SECRET_TOKEN and not re.fullmatch(r"(?!\.+$)[A-Za-z0-9._~\-]+", SECRET_TOKEN)
         "SECRET_TOKEN may only contain letters, digits and the characters . _ ~ - "
         "(for example the output of: openssl rand -hex 24)"
     )
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("true", "1", "yes", "on")
+
+
+# The WebUI dashboard and admin APIs (/, /dashboard, /api/*, /mirrors*). Off by
+# default: the dashboard displays the token-bearing BitChord URL, so anything on
+# the LAN that can load it can read the token.
+WEBUI_ENABLED = _env_flag("WEBUI_ENABLED", False)
+
+# Extra hostnames allowed to reach LAN-only routes, e.g. ALLOWED_HOSTS=nas.home,music.lan
+# (see _host_is_trusted for what is allowed by default).
+ALLOWED_HOSTS = {
+    h.strip().lower().rstrip(".") for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()
+}
+
+# Browser origins allowed to make cross-origin requests. BitChord is a native
+# app and needs no CORS, so none are allowed unless configured.
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
 
 
 # ── Client IP / LAN detection ────────────────────────────────────────────────
@@ -160,6 +184,42 @@ def is_lan_request(request: Request) -> bool:
         if ip is None or not _ip_is_lan(ip):
             return False
     return True
+
+
+_LOCAL_HOST_SUFFIXES = (".local", ".lan", ".home.arpa", ".internal", ".ts.net")
+
+
+def _host_is_trusted(request: Request) -> bool:
+    """
+    Blocks DNS rebinding. A malicious web page can point its own domain at your
+    server's LAN IP; the browser then sends LAN-looking requests and lets the page
+    read the answers (including the token in the manifest). Those requests carry
+    the attacker's domain in Host, so LAN-granted access requires a Host that an
+    outsider cannot control: an IP literal, localhost, a single-label name ("nas"),
+    a local-only suffix (.local, .lan, .home.arpa, .internal, .ts.net), or ALLOWED_HOSTS.
+    """
+    host = _first_header_value(request.headers.get("host")).lower()
+    if host.startswith("["):
+        return _parse_ip(host) is not None
+    name = host.rsplit(":", 1)[0].rstrip(".") if host.count(":") <= 1 else host
+    if not name:
+        return False
+    if name in ("localhost", "testserver", "testclient") or name in ALLOWED_HOSTS:
+        return True
+    if _parse_ip(name) is not None:
+        return True
+    if "." not in name:
+        return True
+    return name.endswith(_LOCAL_HOST_SUFFIXES)
+
+
+def _origin_is_same_site(request: Request) -> bool:
+    """CSRF guard for state-changing requests: a foreign page's form/fetch carries its own Origin."""
+    origin = request.headers.get("origin")
+    if not origin or origin == "null":
+        return origin is None
+    origin_host = urlparse(origin).netloc.lower()
+    return origin_host == _first_header_value(request.headers.get("host")).lower()
 
 
 def _has_valid_token_prefix(path: str) -> bool:
@@ -315,6 +375,10 @@ async def lifespan(app: FastAPI):
             logger.warning("SECRET_TOKEN is shorter than 16 characters; use a longer random value.")
     else:
         logger.warning("SECRET_TOKEN is not set: BitChord routes are accessible without token prefix.")
+    if not WEBUI_ENABLED:
+        logger.info("WebUI and admin APIs are disabled (set WEBUI_ENABLED=true to enable them on the LAN).")
+    if SECRET_TOKEN:
+        logger.info("BitChord module URL: https://<your-host>/s/<SECRET_TOKEN>/bitchord-module.json")
     if LAN_CIDRS_CONFIGURED:
         logger.info(f"LAN_CIDRS active: {', '.join(str(n) for n in LAN_NETWORKS) or 'loopback only'}")
 
@@ -348,53 +412,67 @@ app = FastAPI(
     openapi_url=None,
 )
 
-# No cookies or HTTP auth are used, so credentials stay off.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Previously allow_origins=["*"], which let ANY website open in a browser on your
+# LAN fetch() this server and read the answers, including the token in the
+# manifest. BitChord is a native app and is unaffected by CORS.
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["GET", "HEAD"],
+        allow_headers=["Range"],
+    )
+
+
+_ADMIN_PREFIXES = ("/api/", "/mirrors")
+
+
+def _not_found() -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": "Not found"})
 
 
 @app.middleware("http")
 async def security_gate_middleware(request: Request, call_next):
     """
-    1. Allows /health (Docker health checks).
-    2. Restricts WebUI (/, /dashboard) and admin APIs (/api/*, /mirrors*) to LAN IPs only.
-    3. Enforces /s/<SECRET_TOKEN>/ prefix on BitChord & audio routes when SECRET_TOKEN is set.
+    1. Allows /health (Docker health checks); outsiders only get a bare status.
+    2. WebUI (/, /dashboard) and admin APIs (/api/*, /mirrors*) exist only with
+       WEBUI_ENABLED=true, and then only for LAN clients using a trusted Host,
+       with a same-origin check on POSTs.
+    3. Enforces /s/<SECRET_TOKEN>/ on BitChord & audio routes when SECRET_TOKEN is set.
+       Unprefixed access is allowed from the LAN, again only with a trusted Host.
+    Every refusal is a 404 so a probe cannot tell that the service exists.
     """
     path = request.url.path
 
     if path == "/health":
         return await call_next(request)
 
-    lan = is_lan_request(request)
+    lan = is_lan_request(request) and _host_is_trusted(request)
 
-    # LAN-only WebUI & management routes
-    if path in ("/", "/dashboard") or path.startswith("/api/") or path.startswith("/mirrors"):
-        if not lan:
-            return JSONResponse(status_code=404, content={"detail": "Not found"})
+    if path in ("/", "/dashboard") or path.startswith(_ADMIN_PREFIXES):
+        if not WEBUI_ENABLED or not lan:
+            return _not_found()
+        if request.method not in ("GET", "HEAD", "OPTIONS") and not _origin_is_same_site(request):
+            return JSONResponse(status_code=403, content={"detail": "Cross-site request refused"})
         return await call_next(request)
 
-    # Token-protected BitChord & streaming routes
     if SECRET_TOKEN:
-        if _has_valid_token_prefix(path):
+        if _has_valid_token_prefix(path) or lan:
             return await call_next(request)
-        # Allow unprefixed calls only from local LAN for quick testing
-        if lan:
-            return await call_next(request)
-        return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+        return _not_found()
 
     return await call_next(request)
 
 
 # ── Health & Status Endpoints ────────────────────────────────────────────────
 
-@app.get("/health", response_model=HealthResponse, tags=["Monitoring"])
-async def health_check():
-    """System health check and live mirror pool summary."""
+@app.get("/health", tags=["Monitoring"])
+async def health_check(request: Request):
+    """System health check. Details (mirror pool, cache, uptime) are LAN-only."""
+    if not (is_lan_request(request) and _host_is_trusted(request)):
+        summary = mirror_manager.get_summary()
+        return {"status": "healthy" if summary.healthy > 0 else "degraded"}
     uptime = time.time() - START_TIME
     summary = mirror_manager.get_summary()
     cache_count = await db.get_total_cache_entries()

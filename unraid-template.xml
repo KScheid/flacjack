@@ -29,6 +29,8 @@
   <Config Name="Default Quality" Target="DEFAULT_QUALITY" Default="HI_RES_LOSSLESS" Mode="" Description="HI_RES_LOSSLESS, LOSSLESS, or HIGH" Type="Variable" Display="always" Required="false" Mask="false">HI_RES_LOSSLESS</Config>
   <Config Name="Max Cache Size (GB)" Target="MAX_CACHE_GB" Default="10" Mode="" Description="Maximum SSD cache storage for audio prefetch" Type="Variable" Display="always" Required="false" Mask="false">10</Config>
   <Config Name="Prefetch Lookahead" Target="PREFETCH_LOOKAHEAD" Default="2" Mode="" Description="Number of upcoming tracks to prefetch in background" Type="Variable" Display="always" Required="false" Mask="false">2</Config>
+  <Config Name="Secret Token" Target="SECRET_TOKEN" Default="" Mode="" Description="Required for remote access. URL-safe, 16+ chars (openssl rand -hex 24). Module URL: https://HOST/s/TOKEN/bitchord-module.json" Type="Variable" Display="always" Required="false" Mask="true"></Config>
+  <Config Name="Enable WebUI" Target="WEBUI_ENABLED" Default="false" Mode="" Description="Enable the LAN-only dashboard (it displays your secret token)" Type="Variable" Display="always" Required="false" Mask="false">false</Config>
   <Config Name="Enable Prefetching" Target="PREFETCH_ENABLED" Default="true" Mode="" Description="Enable background queue prefetching (true/false)" Type="Variable" Display="always" Required="false" Mask="false">true</Config>
   <Config Name="Enable FLAC Archiving" Target="ENABLE_FLAC_ARCHIVE" Default="false" Mode="" Description="Set to true to permanently archive all played tracks to /music" Type="Variable" Display="always" Required="false" Mask="false">false</Config>
 </Container>

@@ -41,6 +41,7 @@ Production-ready, self-hosted Python (FastAPI) microservice bridging public Hi-F
 
 2. **Embedded WebUI Dashboard (`dashboard.py`):**
    - Single-page responsive dark-mode management console accessible at `http://<SERVER-IP>:8742/`.
+   - **Disabled by default** (it displays your token). Set `WEBUI_ENABLED=true` to turn it on; it is then reachable from the LAN/Tailscale only.
    - **Live Monitoring:** Real-time uptime counter, healthy mirror pool status, and mirror latency ranking.
    - **SSD Cache Metrics:** Total cached tracks, storage consumed, cache hit rate percentage, and active prefetch queue depth.
    - **Built-in Lossless Audio Player:** Search tracks and preview full lossless FLAC audio directly in your browser.
@@ -120,7 +121,7 @@ Production-ready, self-hosted Python (FastAPI) microservice bridging public Hi-F
 2. Navigate to **Settings** ➔ **Audio Sources** (or **Manage Sources**).
 3. Tap **Add Source** (or paste custom source).
 4. Enter your `hifi-bridge` module URL:
-   - **Over Tailscale:** `https://monolith.tail6dbdcb.ts.net:8742/bitchord-module.json`
+   - **Over Tailscale:** `https://<machine>.<tailnet>.ts.net:8742/bitchord-module.json`
    - **Over Home LAN:** `http://192.168.1.xxx:8742/bitchord-module.json`
 5. BitChord will query the manifest and activate **Hi-Fi Bridge (Monochrome Lossless)**.
 6. Under source quality settings, pick your preferred tier:
@@ -140,6 +141,9 @@ Production-ready, self-hosted Python (FastAPI) microservice bridging public Hi-F
 | `PGID` | `100` | Unraid group ID (`users`). |
 | `DEFAULT_QUALITY` | `HI_RES_LOSSLESS` | Default quality tier (`HI_RES_LOSSLESS`, `LOSSLESS`, `HIGH`). |
 | `PREFETCH_ENABLED` | `true` | Enables background lookahead queue prefetching. |
+| `WEBUI_ENABLED` | `false` | Enables the dashboard and admin APIs (LAN/Tailscale only). Off by default because the dashboard shows the token. |
+| `ALLOWED_HOSTS` | _(empty)_ | Extra hostnames trusted for LAN access (guards against DNS rebinding). IPs, `localhost`, single-label names and `.local`/`.lan`/`.home.arpa`/`.internal`/`.ts.net` are trusted already. |
+| `CORS_ORIGINS` | _(empty)_ | Browser origins allowed cross-origin access. Not needed for BitChord. |
 | `PROXY_STREAMS` | `true` | Serve playback through the proxy, which re-resolves expired upstream links and resumes dropped connections mid-track. `false` hands clients the raw CDN URL. |
 | `STREAM_RESUME_ATTEMPTS` | `5` | Re-open attempts per upstream outage before a stream is abandoned. |
 | `STREAM_STALL_TIMEOUT` | `20` | Seconds without data from upstream before the connection is resumed. |

@@ -7,6 +7,7 @@ and serves seamless FLAC audio streaming with HTTP Range support.
 
 import asyncio
 import base64
+import ipaddress
 import json
 import logging
 import os
@@ -51,6 +52,10 @@ _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+# "private" lets the player keep its own copy but tells shared caches such as
+# Cloudflare not to store the audio. (With "public", Cloudflare caches .flac at
+# its edge by default, which is the large-file use its free-plan terms restrict.)
+AUDIO_CACHE_CONTROL = "private, max-age=86400"
 _CONTENT_RANGE_RE = re.compile(r"bytes\s+(\d+)-(\d+)/(\d+|\*)")
 
 VALID_QUALITIES = {tier.value for tier in QualityTier}
@@ -123,10 +128,23 @@ def _as_int(value: Any) -> Optional[int]:
 
 
 def _is_audio_url(value: Any) -> bool:
+    """
+    URLs come from third-party mirrors. Besides skipping web pages, refuse any
+    that point at this machine or the private network, so a malicious mirror
+    cannot make the proxy fetch from inside your LAN.
+    """
     if not isinstance(value, str) or not value.startswith(("http://", "https://")):
         return False
-    host = (urlparse(value).hostname or "").lower()
-    return host not in _NON_AUDIO_HOSTS
+    host = (urlparse(value).hostname or "").lower().rstrip(".")
+    if not host or host in _NON_AUDIO_HOSTS:
+        return False
+    if host == "localhost" or host.endswith((".localhost", ".local", ".lan", ".internal", ".home.arpa")):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return ip.is_global
 
 
 def _internal_stream_url(base_url: str, track_id: str, quality: Optional[str] = None) -> str:
@@ -751,7 +769,7 @@ class StreamResolver:
         response_headers = {
             "Content-Type": media_type,
             "Accept-Ranges": "bytes",
-            "Cache-Control": "public, max-age=31536000, immutable",
+            "Cache-Control": AUDIO_CACHE_CONTROL,
             "X-HiFi-Cache": "HIT",
         }
         if content_disposition:
@@ -1176,7 +1194,7 @@ class StreamResolver:
             response_headers = {
                 "Content-Type": audio_content_type,
                 "Accept-Ranges": "bytes",
-                "Cache-Control": "public, max-age=31536000, immutable",
+                "Cache-Control": AUDIO_CACHE_CONTROL,
                 "X-HiFi-Cache": "MISS",
             }
             if "Content-Length" in upstream_resp.headers:
