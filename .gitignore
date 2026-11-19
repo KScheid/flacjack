@@ -43,6 +43,7 @@ music/
 # Environment
 .env
 .env.local
+secret_token
 
 # OS
 .DS_Store

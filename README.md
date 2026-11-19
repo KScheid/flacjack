@@ -120,14 +120,47 @@ Production-ready, self-hosted Python (FastAPI) microservice bridging public Hi-F
 1. Open **BitChord** on your Android device.
 2. Navigate to **Settings** ➔ **Audio Sources** (or **Manage Sources**).
 3. Tap **Add Source** (or paste custom source).
-4. Enter your `hifi-bridge` module URL:
-   - **Over Tailscale:** `https://<machine>.<tailnet>.ts.net:8742/bitchord-module.json`
-   - **Over Home LAN:** `http://192.168.1.xxx:8742/bitchord-module.json`
+4. Enter your module URL. It always includes your secret token (see [Security & Remote Access](#security--remote-access)):
+   - **Over Tailscale:** `https://<machine>.<tailnet>.ts.net:8742/s/<TOKEN>/bitchord-module.json`
+   - **Over Home LAN:** `http://192.168.1.xxx:8742/s/<TOKEN>/bitchord-module.json`
+   - **Through a tunnel / reverse proxy:** `https://music.example.com/s/<TOKEN>/bitchord-module.json`
 5. BitChord will query the manifest and activate **Hi-Fi Bridge (Monochrome Lossless)**.
 6. Under source quality settings, pick your preferred tier:
    - `HI_RES_LOSSLESS` (24-bit FLAC)
    - `LOSSLESS` (16-bit FLAC)
    - `HIGH` (320kbps AAC)
+
+---
+
+## Security & Remote Access
+
+Every install has its own secret token, and every BitChord route requires it in
+the path (`/s/<TOKEN>/...`). Requests without it get a plain `404`.
+
+- **Getting your token:** if you don't set `SECRET_TOKEN`, FlacJack generates a
+  random one on first start, saves it to `/data/secret_token` (readable only by
+  the container user) and prints it in the container log:
+  ```bash
+  docker logs flacjack 2>&1 | grep -A4 "secret token"
+  ```
+  Or set your own with `SECRET_TOKEN=$(openssl rand -hex 24)` (16+ characters,
+  letters, digits and `. _ ~ -`). A token you set yourself is never logged.
+- **Rotating it:** delete `/data/secret_token` (or change `SECRET_TOKEN`), restart,
+  and re-add the source in BitChord.
+- **Never share your module URL.** Anyone who has it can stream through your server.
+- **WebUI:** off by default because it displays the token. With `WEBUI_ENABLED=true`
+  it is reachable only from LAN/Tailscale addresses.
+- **Remote access, safest first:**
+  1. **Tailscale.** Nothing is exposed to the internet.
+  2. **Cloudflare Tunnel.** Works out of the box. Audio is sent with
+     `Cache-Control: private`, so Cloudflare does not store it, but Cloudflare's
+     free-plan terms restrict serving lots of audio. Personal use is your call.
+  3. **Reverse proxy (Caddy, Nginx, Traefik, NPM).** It **must** send
+     `X-Forwarded-For`. All of these do by default. Without it, internet traffic
+     looks like it comes from the proxy's private IP.
+- **Don't port-forward 8742** directly to the internet. Put it behind one of the above.
+- `ALLOW_LAN_WITHOUT_TOKEN=true` lets LAN/Tailscale clients skip the token. Only
+  enable it if no reverse proxy sits in front of FlacJack.
 
 ---
 
@@ -141,6 +174,8 @@ Production-ready, self-hosted Python (FastAPI) microservice bridging public Hi-F
 | `PGID` | `100` | Unraid group ID (`users`). |
 | `DEFAULT_QUALITY` | `HI_RES_LOSSLESS` | Default quality tier (`HI_RES_LOSSLESS`, `LOSSLESS`, `HIGH`). |
 | `PREFETCH_ENABLED` | `true` | Enables background lookahead queue prefetching. |
+| `SECRET_TOKEN` | _(auto-generated)_ | Your private access token. Generated and saved to `/data/secret_token` if unset. |
+| `ALLOW_LAN_WITHOUT_TOKEN` | `false` | Let LAN/Tailscale clients use FlacJack without the token. Unsafe behind a reverse proxy that doesn't send `X-Forwarded-For`. |
 | `WEBUI_ENABLED` | `false` | Enables the dashboard and admin APIs (LAN/Tailscale only). Off by default because the dashboard shows the token. |
 | `ALLOWED_HOSTS` | _(empty)_ | Extra hostnames trusted for LAN access (guards against DNS rebinding). IPs, `localhost`, single-label names and `.local`/`.lan`/`.home.arpa`/`.internal`/`.ts.net` are trusted already. |
 | `CORS_ORIGINS` | _(empty)_ | Browser origins allowed cross-origin access. Not needed for BitChord. |

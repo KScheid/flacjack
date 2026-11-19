@@ -6,6 +6,7 @@ to the BitChord Android music client.
 
 import asyncio
 import hmac
+import secrets
 import ipaddress
 import logging
 import os
@@ -13,14 +14,14 @@ import re
 import time
 from urllib.parse import urlparse
 from contextlib import asynccontextmanager
-from typing import List, Optional, Set, Union
+from typing import List, Optional, Set, Tuple, Union
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.archiver import archiver
 from app.dashboard import render_dashboard_html
-from app.database import db
+from app.database import DB_PATH, db
 from app.mirror_manager import mirror_manager
 from app.models import (
     AddonManifest,
@@ -47,15 +48,67 @@ logger = logging.getLogger("hifi-bridge")
 
 START_TIME = time.time()
 DEFAULT_QUALITY = os.environ.get("DEFAULT_QUALITY", QualityTier.HI_RES_LOSSLESS.value)
-SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "").strip()
+MIN_TOKEN_LENGTH = 16
+_TOKEN_RE = re.compile(r"(?!\.+$)[A-Za-z0-9._~\-]+")
+TOKEN_FILE = os.environ.get("TOKEN_FILE", "").strip() or os.path.join(
+    os.path.dirname(os.path.abspath(DB_PATH)), "secret_token"
+)
 
-# The token becomes part of every URL, so it has to be URL-safe. Anything else
-# would silently break routing or the baseUrl handed to BitChord.
-if SECRET_TOKEN and not re.fullmatch(r"(?!\.+$)[A-Za-z0-9._~\-]+", SECRET_TOKEN):
-    raise RuntimeError(
-        "SECRET_TOKEN may only contain letters, digits and the characters . _ ~ - "
-        "(for example the output of: openssl rand -hex 24)"
-    )
+
+def _validate_token(token: str, source: str) -> str:
+    # The token becomes part of every URL, so it has to be URL-safe. Anything else
+    # would silently break routing or the baseUrl handed to BitChord.
+    if not _TOKEN_RE.fullmatch(token):
+        raise RuntimeError(
+            f"{source} may only contain letters, digits and the characters . _ ~ - "
+            "(for example the output of: openssl rand -hex 24)"
+        )
+    if len(token) < MIN_TOKEN_LENGTH:
+        raise RuntimeError(
+            f"{source} must be at least {MIN_TOKEN_LENGTH} characters "
+            "(for example the output of: openssl rand -hex 24)"
+        )
+    return token
+
+
+def _load_or_create_token() -> Tuple[str, str]:
+    """
+    Every install gets its own secret. Returns (token, origin) where origin is
+    "env", "file" or "generated". With no SECRET_TOKEN set, a random token is
+    created on first start and kept in TOKEN_FILE (next to the database), so a
+    fresh install is never reachable without one and no two installs share one.
+    """
+    env_token = os.environ.get("SECRET_TOKEN", "").strip()
+    if env_token:
+        return _validate_token(env_token, "SECRET_TOKEN"), "env"
+
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            stored = f.read().strip()
+        if stored:
+            return _validate_token(stored, f"Token file {TOKEN_FILE}"), "file"
+    except FileNotFoundError:
+        pass
+
+    token = secrets.token_hex(24)
+    try:
+        os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(token + "\n")
+    except FileExistsError:
+        # Another worker created it first; use theirs so all workers agree.
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            return _validate_token(f.read().strip(), f"Token file {TOKEN_FILE}"), "file"
+    except OSError as e:
+        logger.warning(
+            f"Could not save the generated token to {TOKEN_FILE} ({e}); it will change on "
+            "every restart. Set SECRET_TOKEN or make the data directory writable."
+        )
+    return token, "generated"
+
+
+SECRET_TOKEN, TOKEN_ORIGIN = _load_or_create_token()
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -69,6 +122,13 @@ def _env_flag(name: str, default: bool) -> bool:
 # default: the dashboard displays the token-bearing BitChord URL, so anything on
 # the LAN that can load it can read the token.
 WEBUI_ENABLED = _env_flag("WEBUI_ENABLED", False)
+
+# Lets LAN/Tailscale clients use BitChord routes without the /s/<token> prefix.
+# Off by default: if a reverse proxy in front of FlacJack does not send
+# X-Forwarded-For, every internet request looks like it comes from the proxy's
+# private IP, and this would hand the whole service (and the token, via the
+# manifest) to anyone.
+ALLOW_LAN_WITHOUT_TOKEN = _env_flag("ALLOW_LAN_WITHOUT_TOKEN", False)
 
 # Extra hostnames allowed to reach LAN-only routes, e.g. ALLOWED_HOSTS=nas.home,music.lan
 # (see _host_is_trusted for what is allowed by default).
@@ -369,16 +429,25 @@ async def _cache_cleanup_loop():
 async def lifespan(app: FastAPI):
     """Application startup and shutdown orchestration."""
     logger.info("Initializing hifi-bridge microservice...")
-    if SECRET_TOKEN:
-        logger.info("SECRET_TOKEN is active: external BitChord routes require /s/<SECRET_TOKEN>/...")
-        if len(SECRET_TOKEN) < 16:
-            logger.warning("SECRET_TOKEN is shorter than 16 characters; use a longer random value.")
+    if TOKEN_ORIGIN == "env":
+        logger.info("Using SECRET_TOKEN from the environment.")
     else:
-        logger.warning("SECRET_TOKEN is not set: BitChord routes are accessible without token prefix.")
+        # Printed only for a token FlacJack made itself, so the owner can find it.
+        # A token you set yourself is never written to the logs.
+        print(
+            "\n" + "=" * 72 + "\n"
+            f"  FlacJack secret token ({'newly generated' if TOKEN_ORIGIN == 'generated' else 'from ' + TOKEN_FILE}):\n"
+            f"    {SECRET_TOKEN}\n"
+            "  Add this to BitChord as:\n"
+            f"    http(s)://<your-host>/s/{SECRET_TOKEN}/bitchord-module.json\n"
+            "  Keep it private. To change it, delete the token file or set SECRET_TOKEN.\n"
+            + "=" * 72 + "\n",
+            flush=True,
+        )
+    if ALLOW_LAN_WITHOUT_TOKEN:
+        logger.warning("ALLOW_LAN_WITHOUT_TOKEN is on: LAN/Tailscale clients can use FlacJack without the token.")
     if not WEBUI_ENABLED:
         logger.info("WebUI and admin APIs are disabled (set WEBUI_ENABLED=true to enable them on the LAN).")
-    if SECRET_TOKEN:
-        logger.info("BitChord module URL: https://<your-host>/s/<SECRET_TOKEN>/bitchord-module.json")
     if LAN_CIDRS_CONFIGURED:
         logger.info(f"LAN_CIDRS active: {', '.join(str(n) for n in LAN_NETWORKS) or 'loopback only'}")
 
@@ -439,8 +508,8 @@ async def security_gate_middleware(request: Request, call_next):
     2. WebUI (/, /dashboard) and admin APIs (/api/*, /mirrors*) exist only with
        WEBUI_ENABLED=true, and then only for LAN clients using a trusted Host,
        with a same-origin check on POSTs.
-    3. Enforces /s/<SECRET_TOKEN>/ on BitChord & audio routes when SECRET_TOKEN is set.
-       Unprefixed access is allowed from the LAN, again only with a trusted Host.
+    3. Enforces /s/<SECRET_TOKEN>/ on BitChord & audio routes. Unprefixed access
+       only with ALLOW_LAN_WITHOUT_TOKEN=true, from the LAN, with a trusted Host.
     Every refusal is a 404 so a probe cannot tell that the service exists.
     """
     path = request.url.path
@@ -457,12 +526,9 @@ async def security_gate_middleware(request: Request, call_next):
             return JSONResponse(status_code=403, content={"detail": "Cross-site request refused"})
         return await call_next(request)
 
-    if SECRET_TOKEN:
-        if _has_valid_token_prefix(path) or lan:
-            return await call_next(request)
-        return _not_found()
-
-    return await call_next(request)
+    if _has_valid_token_prefix(path) or (lan and ALLOW_LAN_WITHOUT_TOKEN):
+        return await call_next(request)
+    return _not_found()
 
 
 # ── Health & Status Endpoints ────────────────────────────────────────────────
@@ -611,8 +677,7 @@ async def stream_audio_file(track_id: str, request: Request):
 
 # Mount router at root (for LAN) and under /s/{SECRET_TOKEN} (for external BitChord)
 app.include_router(bitchord_router)
-if SECRET_TOKEN:
-    app.include_router(bitchord_router, prefix=f"/s/{SECRET_TOKEN}")
+app.include_router(bitchord_router, prefix=f"/s/{SECRET_TOKEN}")
 
 
 # ── Operational & Cache APIs (LAN Only) ──────────────────────────────────────

@@ -4,8 +4,14 @@ Lightweight, responsive dark-mode management console with zero external dependen
 Ideal for Unraid Docker WebUI, local management, mirror monitoring, and in-browser testing.
 """
 
+import json
+from urllib.parse import urlparse
+
 def render_dashboard_html(base_url: str, version: str = "2.0.0") -> str:
     """Generates the single-page HTML/CSS/JS dashboard."""
+    # Search and playback go through the token-prefixed routes, which work
+    # whether or not ALLOW_LAN_WITHOUT_TOKEN is on.
+    api_prefix = json.dumps(urlparse(base_url).path.rstrip("/"))
     return f"""<!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
@@ -361,7 +367,7 @@ def render_dashboard_html(base_url: str, version: str = "2.0.0") -> str:
       resultsDiv.innerHTML = '<div class="py-8 text-center text-zinc-500 text-sm">Querying upstream Hi-Fi pool...</div>';
 
       try {{
-        const res = await fetch(`/search?q=${{encodeURIComponent(query)}}&limit=10`);
+        const res = await fetch(`${{API_PREFIX}}/search?q=${{encodeURIComponent(query)}}&limit=10`);
         const data = await res.json();
         const tracks = data.tracks || [];
 
@@ -402,6 +408,8 @@ def render_dashboard_html(base_url: str, version: str = "2.0.0") -> str:
         btn.innerHTML = '<span>🔍</span> <span>Search</span>';
       }}
     }}
+
+    const API_PREFIX = {api_prefix};
 
     // Everything shown here comes from third-party mirrors: always escape it.
     function esc(value) {{
@@ -444,7 +452,7 @@ def render_dashboard_html(base_url: str, version: str = "2.0.0") -> str:
         trackArt.innerHTML = '🎵';
       }}
 
-      audio.src = `/stream/audio/${{encodeURIComponent(trackId)}}.flac`;
+      audio.src = `${{API_PREFIX}}/stream/audio/${{encodeURIComponent(trackId)}}.flac`;
       audio.play();
 
       // Refresh stats after a moment to reflect caching

@@ -1,0 +1,12 @@
+# Keep secrets and local data out of built images (they may be published).
+.env
+.env.*
+!.env.example
+data/
+music/
+secret_token
+*.db
+*.db-*
+.git/
+__pycache__/
+*.py[cod]
