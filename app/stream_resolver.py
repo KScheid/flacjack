@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple
@@ -211,6 +212,11 @@ class StreamResolver:
     def __init__(self):
         self._stream_client: Optional[httpx.AsyncClient] = None
         self._background_tasks: Set[asyncio.Task] = set()
+        # track_id -> (source URL, total bytes, time). A player that reconnects
+        # mid-track asks for a byte offset into the file it was already playing;
+        # serving that offset from a different file (another quality tier, a
+        # re-encoded copy) hands the decoder garbage and it fails to seek.
+        self._source_pins: Dict[str, Tuple[str, int, float]] = {}
 
     async def aclose(self) -> None:
         """Cancels background work and closes the upstream audio client."""
@@ -946,25 +952,68 @@ class StreamResolver:
         clean_id: str,
         quality: str,
         headers: Dict[str, str],
+        expected_total: Optional[int] = None,
+        pinned_url: str = "",
     ) -> Tuple[Optional[httpx.Response], str]:
         """
-        Tries the cached sources first, then re-resolves once. A cached direct URL
-        is a signed CDN link that can expire long before the cache entry does.
+        Tries the source this track was last served from, then the cached sources,
+        then re-resolves once. A cached direct URL is a signed CDN link that can
+        expire long before the cache entry does.
+
+        With `expected_total` (a mid-track reconnect), a source whose file size
+        differs is only used when nothing matching can be found.
         """
         tried: Set[str] = set()
+        mismatched: List[str] = []
+
+        async def attempt(url: str) -> Optional[httpx.Response]:
+            if not url or url in tried:
+                return None
+            tried.add(url)
+            resp = await self._open_upstream(url, headers)
+            if resp is None:
+                return None
+            total = self._response_span(resp)[2]
+            if expected_total is not None and total is not None and total != expected_total:
+                logger.info(
+                    f"[STREAM] {clean_id}: {url.split('?')[0]} is a different file "
+                    f"({total} bytes, expected {expected_total}); looking further"
+                )
+                mismatched.append(url)
+                await resp.aclose()
+                return None
+            return resp
+
+        resp = await attempt(pinned_url)
+        if resp is not None:
+            return resp, pinned_url
         for refresh in (False, True):
             if refresh and is_snowflake_id(clean_id):
                 break
             for url in await self._candidate_urls(clean_id, quality, refresh=refresh):
-                if url in tried:
-                    continue
-                tried.add(url)
-                resp = await self._open_upstream(url, headers)
+                resp = await attempt(url)
                 if resp is not None:
                     return resp, url
             if not refresh and tried:
                 logger.info(f"[STREAM] Cached sources for {clean_id} failed, re-resolving")
+
+        for url in mismatched:
+            # Better than failing outright, but the player may still reject it.
+            logger.warning(f"[STREAM] {clean_id}: no source matches the file being played; using a different one")
+            resp = await self._open_upstream(url, headers)
+            if resp is not None:
+                return resp, url
         return None, ""
+
+    def _pin_source(self, clean_id: str, url: str, total: Optional[int]) -> None:
+        if not url or total is None:
+            return
+        now = time.monotonic()
+        self._source_pins[clean_id] = (url, total, now)
+        if len(self._source_pins) > 500:
+            cutoff = now - 6 * 3600
+            for key in [k for k, v in self._source_pins.items() if v[2] < cutoff]:
+                del self._source_pins[key]
 
     @staticmethod
     def _response_span(resp: httpx.Response) -> Tuple[int, Optional[int], Optional[int]]:
@@ -1025,6 +1074,8 @@ class StreamResolver:
         base_headers: Dict[str, str],
         tee_to_cache: bool,
         expected_total_bytes: Optional[int],
+        start_at: Optional[int] = None,
+        stop_at: Optional[int] = None,
     ) -> AsyncIterator[bytes]:
         """
         Streams upstream audio to the client, optionally writing a copy to the disk cache.
@@ -1041,6 +1092,10 @@ class StreamResolver:
         current: Optional[httpx.Response] = upstream_resp
         position, end, total = self._response_span(upstream_resp)
         skip = 0
+        if start_at is not None:
+            # Upstream ignored the client's Range and sent the whole file:
+            # discard bytes before the requested offset and stop at its end.
+            skip, position, end = start_at, start_at, stop_at
         attempts = 0
         resumed_at = position
 
@@ -1181,9 +1236,20 @@ class StreamResolver:
         elif request.method == "HEAD":
             forward_headers["Range"] = "bytes=0-0"
 
-        upstream_resp, source_url = await self._open_first_available(clean_id, quality, forward_headers)
+        # A Range that does not start at 0 is a seek or a reconnect mid-track: it
+        # must be answered from the same file the player already has.
+        pin = self._source_pins.get(clean_id)
+        mid_track = bool(range_header) and range_header.replace(" ", "") != "bytes=0-"
+        upstream_resp, source_url = await self._open_first_available(
+            clean_id,
+            quality,
+            forward_headers,
+            expected_total=pin[1] if (pin and mid_track) else None,
+            pinned_url=pin[0] if pin else "",
+        )
         if upstream_resp is None:
             raise HTTPException(status_code=502, detail="All upstream audio sources failed")
+        self._pin_source(clean_id, source_url, self._response_span(upstream_resp)[2])
 
         handed_off = False
         try:
@@ -1225,8 +1291,24 @@ class StreamResolver:
                 return head_response
 
             tee_to_cache, expected_total_bytes = self._plan_cache_tee(upstream_resp, range_header)
+            start_at = stop_at = None
+            upstream_length = upstream_resp.headers.get("Content-Length", "")
+            if range_header and status_code == 200 and upstream_length.isdigit():
+                # Upstream ignored the Range and sent the whole file. Passing that
+                # on would give a seeking player bytes from the wrong offset, which
+                # is exactly what makes the decoder fail its seek. Answer the Range
+                # properly instead. Raises 416 if it is out of bounds.
+                byte_range = self._parse_range(range_header, int(upstream_length))
+                if byte_range:
+                    start_at, stop_at = byte_range
+                    status_code = 206
+                    response_headers["Content-Range"] = f"bytes {start_at}-{stop_at}/{upstream_length}"
+                    response_headers["Content-Length"] = str(stop_at - start_at + 1)
+                    if start_at != 0:
+                        tee_to_cache = False
             body = self._proxy_body(
-                upstream_resp, source_url, clean_id, quality, base_headers, tee_to_cache, expected_total_bytes
+                upstream_resp, source_url, clean_id, quality, base_headers, tee_to_cache, expected_total_bytes,
+                start_at=start_at, stop_at=stop_at,
             )
             handed_off = True  # the streaming body now owns and closes the response
             return StreamingResponse(body, status_code=status_code, headers=response_headers)
