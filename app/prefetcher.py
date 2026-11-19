@@ -1,6 +1,6 @@
 """
 Smart Lookahead Prefetcher & Local Audio Disk Cache for hifi-bridge.
-Caches audio files locally for 0ms latency playback, immune to upstream rate limits.
+Caches audio files locally so repeat plays are instant and do not contact upstream again.
 Automatically pre-resolves and buffers the next tracks in queue/album in the background.
 """
 

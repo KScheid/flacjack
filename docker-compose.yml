@@ -15,7 +15,7 @@ services:
       - PORT=8742
       - HOST=0.0.0.0
       - DEFAULT_QUALITY=HI_RES_LOSSLESS   # Options: HI_RES_LOSSLESS, LOSSLESS, HIGH
-      - AUDIO_CACHE_DIR=/data/audio_cache # Local disk cache for 0ms seek & rate limit immunity
+      - AUDIO_CACHE_DIR=/data/audio_cache # Local disk cache for instant seek and repeat plays
       - MAX_CACHE_GB=10                   # Max disk space allocated for audio cache
       - PREFETCH_LOOKAHEAD=2              # Number of upcoming tracks to prefetch when enabled
       - PREFETCH_ENABLED=false            # Disabled to prevent Cloudflare 429 rate-limiting on single IP
