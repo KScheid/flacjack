@@ -1,6 +1,6 @@
 # `FlacJack` 🥞 — Fresh, Warm Stacks of Lossless Audio on Demand
 
-Production-ready, self-hosted Python (FastAPI) microservice bridging public Hi-Fi lossless audio APIs (Monochrome) to the **BitChord** Android music client and any modern web browser.
+Self-hosted Python (FastAPI) service that connects the **BitChord** Android music client (and any modern web browser) to Monochrome-compatible API instances, so you can run your own private BitChord source instead of relying on shared community plugins.
 
 ```
 ┌─────────────────────────────────┐
@@ -25,7 +25,7 @@ Production-ready, self-hosted Python (FastAPI) microservice bridging public Hi-F
 ┌─────────────────────────┐     ┌────────────────────────────────────────┐
 │   Local SSD Cache       │     │  Upstream Hi-Fi Mirrors (Monochrome)   │
 │   /data/audio_cache/    │     │  • tracks.monochrome.st                │
-│   (Rate Limit Immune)   │     │  • INSTANCES.md mirror pool            │
+│   (Fewer upstream calls)│     │  • INSTANCES.md mirror pool            │
 └─────────────────────────┘     └────────────────────────────────────────┘
 ```
 
@@ -35,12 +35,13 @@ Production-ready, self-hosted Python (FastAPI) microservice bridging public Hi-F
 
 1. **Smart Lookahead Queue Prefetcher & Local SSD Disk Cache (`prefetcher.py`):**
    - **0ms Playback & Zero Lag:** Caches audio tracks directly onto local SSD storage (`/data/audio_cache`).
-   - **Rate Limit Immunity:** Buffers the next 2 tracks of your active album or playlist in the background. Playback never stalls or drops due to Cloudflare rate limits (`429` / `403`).
+   - **Fewer Upstream Requests:** Optionally buffers the next tracks of your active album or playlist in the background, and replays cached tracks from disk without contacting upstream again.
    - **Automatic LRU Pruning:** Enforces a configurable cache ceiling (e.g., `MAX_CACHE_GB=10`). When storage hits the limit, least-recently played tracks are pruned automatically.
    - **Full HTTP Range & HEAD Support:** Supports ExoPlayer's media probing (`HEAD` requests) and byte-range seeking (`bytes=start-end`) for scrubbing.
 
 2. **Embedded WebUI Dashboard (`dashboard.py`):**
    - Single-page responsive dark-mode management console accessible at `http://<SERVER-IP>:8742/`.
+   - **Disabled by default** (it displays your token). Set `WEBUI_ENABLED=true` to turn it on; it is then reachable from the LAN/Tailscale only.
    - **Live Monitoring:** Real-time uptime counter, healthy mirror pool status, and mirror latency ranking.
    - **SSD Cache Metrics:** Total cached tracks, storage consumed, cache hit rate percentage, and active prefetch queue depth.
    - **Built-in Lossless Audio Player:** Search tracks and preview full lossless FLAC audio directly in your browser.
@@ -53,7 +54,7 @@ Production-ready, self-hosted Python (FastAPI) microservice bridging public Hi-F
 
 4. **BitChord Custom Module Generator (`/bitchord-module.json` & `/manifest.json`):**
    - Strict conformity with BitChord's native Addon specifications (`resources: ["search", "stream"]`).
-   - Dynamically parses incoming `Host`, `X-Forwarded-*`, and Tailscale MagicDNS headers so that importing works whether on LAN, Tailscale (`monolith...ts.net:8742`), or behind a reverse proxy (Caddy, Nginx).
+   - Dynamically parses incoming `Host`, `X-Forwarded-*`, and Tailscale MagicDNS headers so that importing works whether on LAN, Tailscale (`<machine>.<tailnet>.ts.net:8742`), or behind a reverse proxy (Caddy, Nginx).
 
 5. **Optimized for Docker & Unraid OS:**
    - Multi-stage slim Docker image with `ffmpeg`, `curl`, and `gosu`.
@@ -119,14 +120,47 @@ Production-ready, self-hosted Python (FastAPI) microservice bridging public Hi-F
 1. Open **BitChord** on your Android device.
 2. Navigate to **Settings** ➔ **Audio Sources** (or **Manage Sources**).
 3. Tap **Add Source** (or paste custom source).
-4. Enter your `hifi-bridge` module URL:
-   - **Over Tailscale:** `https://monolith.tail6dbdcb.ts.net:8742/bitchord-module.json`
-   - **Over Home LAN:** `http://192.168.1.xxx:8742/bitchord-module.json`
+4. Enter your module URL. It always includes your secret token (see [Security & Remote Access](#security--remote-access)):
+   - **Over Tailscale:** `https://<machine>.<tailnet>.ts.net:8742/s/<TOKEN>/bitchord-module.json`
+   - **Over Home LAN:** `http://192.168.1.xxx:8742/s/<TOKEN>/bitchord-module.json`
+   - **Through a tunnel / reverse proxy:** `https://music.example.com/s/<TOKEN>/bitchord-module.json`
 5. BitChord will query the manifest and activate **Hi-Fi Bridge (Monochrome Lossless)**.
 6. Under source quality settings, pick your preferred tier:
    - `HI_RES_LOSSLESS` (24-bit FLAC)
    - `LOSSLESS` (16-bit FLAC)
    - `HIGH` (320kbps AAC)
+
+---
+
+## Security & Remote Access
+
+Every install has its own secret token, and every BitChord route requires it in
+the path (`/s/<TOKEN>/...`). Requests without it get a plain `404`.
+
+- **Getting your token:** if you don't set `SECRET_TOKEN`, FlacJack generates a
+  random one on first start, saves it to `/data/secret_token` (readable only by
+  the container user) and prints it in the container log:
+  ```bash
+  docker logs flacjack 2>&1 | grep -A4 "secret token"
+  ```
+  Or set your own with `SECRET_TOKEN=$(openssl rand -hex 24)` (16+ characters,
+  letters, digits and `. _ ~ -`). A token you set yourself is never logged.
+- **Rotating it:** delete `/data/secret_token` (or change `SECRET_TOKEN`), restart,
+  and re-add the source in BitChord.
+- **Never share your module URL.** Anyone who has it can stream through your server.
+- **WebUI:** off by default because it displays the token. With `WEBUI_ENABLED=true`
+  it is reachable only from LAN/Tailscale addresses.
+- **Remote access, safest first:**
+  1. **Tailscale.** Nothing is exposed to the internet.
+  2. **Cloudflare Tunnel.** Works out of the box. Audio is sent with
+     `Cache-Control: private`, so Cloudflare does not store it, but Cloudflare's
+     free-plan terms restrict serving lots of audio. Personal use is your call.
+  3. **Reverse proxy (Caddy, Nginx, Traefik, NPM).** It **must** send
+     `X-Forwarded-For`. All of these do by default. Without it, internet traffic
+     looks like it comes from the proxy's private IP.
+- **Don't port-forward 8742** directly to the internet. Put it behind one of the above.
+- `ALLOW_LAN_WITHOUT_TOKEN=true` lets LAN/Tailscale clients skip the token. Only
+  enable it if no reverse proxy sits in front of FlacJack.
 
 ---
 
@@ -140,6 +174,14 @@ Production-ready, self-hosted Python (FastAPI) microservice bridging public Hi-F
 | `PGID` | `100` | Unraid group ID (`users`). |
 | `DEFAULT_QUALITY` | `HI_RES_LOSSLESS` | Default quality tier (`HI_RES_LOSSLESS`, `LOSSLESS`, `HIGH`). |
 | `PREFETCH_ENABLED` | `true` | Enables background lookahead queue prefetching. |
+| `SECRET_TOKEN` | _(auto-generated)_ | Your private access token. Generated and saved to `/data/secret_token` if unset. |
+| `ALLOW_LAN_WITHOUT_TOKEN` | `false` | Let LAN/Tailscale clients use FlacJack without the token. Unsafe behind a reverse proxy that doesn't send `X-Forwarded-For`. |
+| `WEBUI_ENABLED` | `false` | Enables the dashboard and admin APIs (LAN/Tailscale only). Off by default because the dashboard shows the token. |
+| `ALLOWED_HOSTS` | _(empty)_ | Extra hostnames trusted for LAN access (guards against DNS rebinding). IPs, `localhost`, single-label names and `.local`/`.lan`/`.home.arpa`/`.internal`/`.ts.net` are trusted already. |
+| `CORS_ORIGINS` | _(empty)_ | Browser origins allowed cross-origin access. Not needed for BitChord. |
+| `PROXY_STREAMS` | `true` | Serve playback through the proxy, which re-resolves expired upstream links and resumes dropped connections mid-track. `false` hands clients the raw CDN URL. |
+| `STREAM_RESUME_ATTEMPTS` | `5` | Re-open attempts per upstream outage before a stream is abandoned. |
+| `STREAM_STALL_TIMEOUT` | `20` | Seconds without data from upstream before the connection is resumed. |
 | `PREFETCH_LOOKAHEAD` | `2` | Number of upcoming tracks to prefetch in the background. |
 | `AUDIO_CACHE_DIR` | `/data/audio_cache` | Path for cached audio files on local disk. |
 | `MAX_CACHE_GB` | `10` | Maximum disk space (in GB) before LRU eviction. |
@@ -155,5 +197,9 @@ Production-ready, self-hosted Python (FastAPI) microservice bridging public Hi-F
 ## Troubleshooting & FAQ
 
 - **"Outdated Addon" badge in BitChord:** In BitChord v1.9.1+, self-hosted addons display an "Outdated Addon" label because official addons require a proprietary cryptographic signature. This is cosmetic only; all streaming and search functionality works 100%.
-- **Random playback pauses between songs:** ExoPlayer requires valid HTTP `HEAD` responses and byte-range seeking before streaming audio. `hifi-bridge` natively handles `HEAD` probing and Range responses (`206 Partial Content`).
-- **Cloudflare Rate Limiting (429):** The smart lookahead prefetcher and disk cache ensure that once you start listening, subsequent songs are already stored on local disk and stream at 0ms latency with zero upstream API calls.
+- **Playback pauses or skips mid-song:** Playback goes through FlacJack's proxy, which re-opens dropped upstream connections from the exact byte reached and refreshes expired upstream links. Look for `[STREAM]` lines in the container log to see interruptions and resumes.
+- **Upstream errors (`429` / `5xx`):** FlacJack backs off and fails over to other instances. Tracks already in the disk cache play without contacting upstream.
+
+---
+
+<sub>FlacJack is an independent, non-commercial, open-source project for people running their own server. It hosts, stores and distributes no audio or other copyrighted content, and it is not affiliated with or endorsed by BitChord, Monochrome, TIDAL or any music service. It connects to third-party instances that you choose and that are run by others. You are responsible for how you use it and for complying with the laws where you live and the terms of any service you connect to. Provided "as is", without warranty of any kind.</sub>

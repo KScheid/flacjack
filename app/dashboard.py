@@ -4,8 +4,14 @@ Lightweight, responsive dark-mode management console with zero external dependen
 Ideal for Unraid Docker WebUI, local management, mirror monitoring, and in-browser testing.
 """
 
+import json
+from urllib.parse import urlparse
+
 def render_dashboard_html(base_url: str, version: str = "2.0.0") -> str:
     """Generates the single-page HTML/CSS/JS dashboard."""
+    # Search and playback go through the token-prefixed routes, which work
+    # whether or not ALLOW_LAN_WITHOUT_TOKEN is on.
+    api_prefix = json.dumps(urlparse(base_url).path.rstrip("/"))
     return f"""<!DOCTYPE html>
 <html lang="en" class="dark">
 <head>
@@ -315,14 +321,14 @@ def render_dashboard_html(base_url: str, version: str = "2.0.0") -> str:
 
         const latColor = m.latency_ms < 500 ? 'text-emerald-400' : (m.latency_ms < 1500 ? 'text-amber-400' : 'text-zinc-500');
         const latText = m.latency_ms < 9000 ? `${{Math.round(m.latency_ms)}} ms` : 'timeout';
-        const displayUrl = m.url.replace('https://', '');
+        const displayUrl = esc(m.url.replace('https://', ''));
 
         return `
           <tr class="hover:bg-zinc-900/40 transition">
-            <td class="py-2 text-zinc-200 truncate max-w-[180px]" title="${{m.url}}">${{displayUrl}}</td>
-            <td class="py-2"><span class="px-2 py-0.5 rounded text-[10px] uppercase font-bold border ${{badgeColor}}">${{m.status}}</span></td>
+            <td class="py-2 text-zinc-200 truncate max-w-[180px]" title="${{esc(m.url)}}">${{displayUrl}}</td>
+            <td class="py-2"><span class="px-2 py-0.5 rounded text-[10px] uppercase font-bold border ${{badgeColor}}">${{esc(m.status)}}</span></td>
             <td class="py-2 text-right font-medium ${{latColor}}">${{latText}}</td>
-            <td class="py-2 text-right text-[11px] text-zinc-500 truncate max-w-[120px]" title="${{m.notes || ''}}">${{m.notes || '—'}}</td>
+            <td class="py-2 text-right text-[11px] text-zinc-500 truncate max-w-[120px]" title="${{esc(m.notes)}}">${{esc(m.notes) || '—'}}</td>
           </tr>
         `;
       }}).join('');
@@ -334,13 +340,14 @@ def render_dashboard_html(base_url: str, version: str = "2.0.0") -> str:
         tbody.innerHTML = '<tr><td colspan="3" class="py-4 text-center text-zinc-500 font-sans">No tracks cached yet. Play or search music to prefetch!</td></tr>';
         return;
       }}
-      tbody.innerHTML = files.map(f => {{
+      window._cachedFiles = files;
+      tbody.innerHTML = files.map((f, i) => {{
         return `
           <tr class="hover:bg-zinc-900/40 transition">
-            <td class="py-2 text-zinc-300 truncate max-w-[180px]" title="${{f.filename}}">${{f.filename}}</td>
-            <td class="py-2 text-right text-zinc-400">${{f.size_mb}} MB</td>
+            <td class="py-2 text-zinc-300 truncate max-w-[180px]" title="${{esc(f.filename)}}">${{esc(f.filename)}}</td>
+            <td class="py-2 text-right text-zinc-400">${{esc(f.size_mb)}} MB</td>
             <td class="py-2 text-right">
-              <button onclick="playTrack('${{f.id}}', 'Cached Track ${{f.id}}', 'Local Cache', '')" 
+              <button onclick="playCached(${{i}})" 
                 class="px-2 py-0.5 text-[11px] bg-zinc-800 hover:bg-emerald-600 text-zinc-300 hover:text-white rounded transition">▶ Play</button>
             </td>
           </tr>
@@ -360,31 +367,32 @@ def render_dashboard_html(base_url: str, version: str = "2.0.0") -> str:
       resultsDiv.innerHTML = '<div class="py-8 text-center text-zinc-500 text-sm">Querying upstream Hi-Fi pool...</div>';
 
       try {{
-        const res = await fetch(`/search?q=${{encodeURIComponent(query)}}&limit=10`);
+        const res = await fetch(`${{API_PREFIX}}/search?q=${{encodeURIComponent(query)}}&limit=10`);
         const data = await res.json();
         const tracks = data.tracks || [];
 
         if (tracks.length === 0) {{
           resultsDiv.innerHTML = '<div class="py-8 text-center text-zinc-500 text-sm">No tracks found. Try another search query!</div>';
         }} else {{
-          resultsDiv.innerHTML = tracks.map(t => {{
+          window._searchTracks = tracks;
+          resultsDiv.innerHTML = tracks.map((t, i) => {{
             const dur = t.duration ? `${{Math.floor(t.duration / 60)}}:${{String(Math.floor(t.duration % 60)).padStart(2, '0')}}` : '--:--';
-            const artUrl = t.artworkURL || t.albumArtworkURL || '';
-            const artImg = artUrl ? `<img src="${{artUrl}}" class="w-10 h-10 rounded object-cover">` : `<div class="w-10 h-10 rounded bg-zinc-800 flex items-center justify-center text-xs">🎵</div>`;
+            const artUrl = safeUrl(t.artworkURL || t.albumArtworkURL);
+            const artImg = artUrl ? `<img src="${{esc(artUrl)}}" class="w-10 h-10 rounded object-cover">` : `<div class="w-10 h-10 rounded bg-zinc-800 flex items-center justify-center text-xs">🎵</div>`;
 
             return `
               <div class="flex items-center justify-between p-3 rounded-xl bg-zinc-900/60 hover:bg-zinc-800/80 border border-zinc-800/80 transition gap-3">
                 <div class="flex items-center gap-3 min-w-0">
                   ${{artImg}}
                   <div class="min-w-0">
-                    <div class="font-medium text-sm text-zinc-100 truncate">${{t.title}}</div>
-                    <div class="text-xs text-zinc-400 truncate">${{t.artist}} ${{t.album ? '• ' + t.album : ''}}</div>
+                    <div class="font-medium text-sm text-zinc-100 truncate">${{esc(t.title)}}</div>
+                    <div class="text-xs text-zinc-400 truncate">${{esc(t.artist)}} ${{t.album ? '• ' + esc(t.album) : ''}}</div>
                   </div>
                 </div>
                 <div class="flex items-center gap-3 flex-shrink-0">
                   <span class="text-xs text-zinc-500 font-mono hidden sm:inline">${{dur}}</span>
-                  <span class="text-[10px] px-2 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/80 font-mono hidden sm:inline">${{t.audioQuality || 'FLAC'}}</span>
-                  <button onclick="playTrack('${{t.id}}', '${{escapeQuotes(t.title)}}', '${{escapeQuotes(t.artist)}}', '${{artUrl}}')"
+                  <span class="text-[10px] px-2 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-800/80 font-mono hidden sm:inline">${{esc(t.audioQuality || 'FLAC')}}</span>
+                  <button onclick="playSearch(${{i}})"
                     class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium transition flex items-center gap-1 shadow">
                     <span>▶</span> <span>Play</span>
                   </button>
@@ -394,15 +402,34 @@ def render_dashboard_html(base_url: str, version: str = "2.0.0") -> str:
           }}).join('');
         }}
       }} catch (err) {{
-        resultsDiv.innerHTML = `<div class="py-8 text-center text-red-400 text-sm">Search error: ${{err.message}}</div>`;
+        resultsDiv.innerHTML = `<div class="py-8 text-center text-red-400 text-sm">Search error: ${{esc(err.message)}}</div>`;
       }} finally {{
         btn.disabled = false;
         btn.innerHTML = '<span>🔍</span> <span>Search</span>';
       }}
     }}
 
-    function escapeQuotes(str) {{
-      return (str || '').replace(/'/g, "\\'");
+    const API_PREFIX = {api_prefix};
+
+    // Everything shown here comes from third-party mirrors: always escape it.
+    function esc(value) {{
+      return String(value ?? '').replace(/[&<>"'`]/g, c => ({{
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '`': '&#96;'
+      }})[c]);
+    }}
+
+    function safeUrl(value) {{
+      return typeof value === 'string' && /^https?:[/][/]/i.test(value) ? value : '';
+    }}
+
+    function playSearch(i) {{
+      const t = (window._searchTracks || [])[i];
+      if (t) playTrack(t.id, t.title, t.artist, safeUrl(t.artworkURL || t.albumArtworkURL));
+    }}
+
+    function playCached(i) {{
+      const f = (window._cachedFiles || [])[i];
+      if (f) playTrack(f.id, `Cached Track ${{f.id}}`, 'Local Cache', '');
     }}
 
     function playTrack(trackId, title, artist, artUrl) {{
@@ -417,12 +444,15 @@ def render_dashboard_html(base_url: str, version: str = "2.0.0") -> str:
       trackArtist.innerText = artist;
 
       if (artUrl) {{
-        trackArt.innerHTML = `<img src="${{artUrl}}" class="w-full h-full object-cover">`;
+        const img = document.createElement('img');
+        img.src = artUrl;
+        img.className = 'w-full h-full object-cover';
+        trackArt.replaceChildren(img);
       }} else {{
         trackArt.innerHTML = '🎵';
       }}
 
-      audio.src = `/stream/audio/${{trackId}}.flac`;
+      audio.src = `${{API_PREFIX}}/stream/audio/${{encodeURIComponent(trackId)}}.flac`;
       audio.play();
 
       // Refresh stats after a moment to reflect caching

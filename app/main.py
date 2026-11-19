@@ -6,20 +6,22 @@ to the BitChord Android music client.
 
 import asyncio
 import hmac
+import secrets
 import ipaddress
 import logging
 import os
 import re
 import time
+from urllib.parse import urlparse
 from contextlib import asynccontextmanager
-from typing import List, Optional, Set, Union
+from typing import List, Optional, Set, Tuple, Union
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from app.archiver import archiver
 from app.dashboard import render_dashboard_html
-from app.database import db
+from app.database import DB_PATH, db
 from app.mirror_manager import mirror_manager
 from app.models import (
     AddonManifest,
@@ -46,15 +48,97 @@ logger = logging.getLogger("hifi-bridge")
 
 START_TIME = time.time()
 DEFAULT_QUALITY = os.environ.get("DEFAULT_QUALITY", QualityTier.HI_RES_LOSSLESS.value)
-SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "").strip()
+MIN_TOKEN_LENGTH = 16
+_TOKEN_RE = re.compile(r"(?!\.+$)[A-Za-z0-9._~\-]+")
+TOKEN_FILE = os.environ.get("TOKEN_FILE", "").strip() or os.path.join(
+    os.path.dirname(os.path.abspath(DB_PATH)), "secret_token"
+)
 
-# The token becomes part of every URL, so it has to be URL-safe. Anything else
-# would silently break routing or the baseUrl handed to BitChord.
-if SECRET_TOKEN and not re.fullmatch(r"(?!\.+$)[A-Za-z0-9._~\-]+", SECRET_TOKEN):
-    raise RuntimeError(
-        "SECRET_TOKEN may only contain letters, digits and the characters . _ ~ - "
-        "(for example the output of: openssl rand -hex 24)"
-    )
+
+def _validate_token(token: str, source: str) -> str:
+    # The token becomes part of every URL, so it has to be URL-safe. Anything else
+    # would silently break routing or the baseUrl handed to BitChord.
+    if not _TOKEN_RE.fullmatch(token):
+        raise RuntimeError(
+            f"{source} may only contain letters, digits and the characters . _ ~ - "
+            "(for example the output of: openssl rand -hex 24)"
+        )
+    if len(token) < MIN_TOKEN_LENGTH:
+        raise RuntimeError(
+            f"{source} must be at least {MIN_TOKEN_LENGTH} characters "
+            "(for example the output of: openssl rand -hex 24)"
+        )
+    return token
+
+
+def _load_or_create_token() -> Tuple[str, str]:
+    """
+    Every install gets its own secret. Returns (token, origin) where origin is
+    "env", "file" or "generated". With no SECRET_TOKEN set, a random token is
+    created on first start and kept in TOKEN_FILE (next to the database), so a
+    fresh install is never reachable without one and no two installs share one.
+    """
+    env_token = os.environ.get("SECRET_TOKEN", "").strip()
+    if env_token:
+        return _validate_token(env_token, "SECRET_TOKEN"), "env"
+
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            stored = f.read().strip()
+        if stored:
+            return _validate_token(stored, f"Token file {TOKEN_FILE}"), "file"
+    except FileNotFoundError:
+        pass
+
+    token = secrets.token_hex(24)
+    try:
+        os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
+        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(token + "\n")
+    except FileExistsError:
+        # Another worker created it first; use theirs so all workers agree.
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            return _validate_token(f.read().strip(), f"Token file {TOKEN_FILE}"), "file"
+    except OSError as e:
+        logger.warning(
+            f"Could not save the generated token to {TOKEN_FILE} ({e}); it will change on "
+            "every restart. Set SECRET_TOKEN or make the data directory writable."
+        )
+    return token, "generated"
+
+
+SECRET_TOKEN, TOKEN_ORIGIN = _load_or_create_token()
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("true", "1", "yes", "on")
+
+
+# The WebUI dashboard and admin APIs (/, /dashboard, /api/*, /mirrors*). Off by
+# default: the dashboard displays the token-bearing BitChord URL, so anything on
+# the LAN that can load it can read the token.
+WEBUI_ENABLED = _env_flag("WEBUI_ENABLED", False)
+
+# Lets LAN/Tailscale clients use BitChord routes without the /s/<token> prefix.
+# Off by default: if a reverse proxy in front of FlacJack does not send
+# X-Forwarded-For, every internet request looks like it comes from the proxy's
+# private IP, and this would hand the whole service (and the token, via the
+# manifest) to anyone.
+ALLOW_LAN_WITHOUT_TOKEN = _env_flag("ALLOW_LAN_WITHOUT_TOKEN", False)
+
+# Extra hostnames allowed to reach LAN-only routes, e.g. ALLOWED_HOSTS=nas.home,music.lan
+# (see _host_is_trusted for what is allowed by default).
+ALLOWED_HOSTS = {
+    h.strip().lower().rstrip(".") for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()
+}
+
+# Browser origins allowed to make cross-origin requests. BitChord is a native
+# app and needs no CORS, so none are allowed unless configured.
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
 
 
 # ── Client IP / LAN detection ────────────────────────────────────────────────
@@ -162,6 +246,42 @@ def is_lan_request(request: Request) -> bool:
     return True
 
 
+_LOCAL_HOST_SUFFIXES = (".local", ".lan", ".home.arpa", ".internal", ".ts.net")
+
+
+def _host_is_trusted(request: Request) -> bool:
+    """
+    Blocks DNS rebinding. A malicious web page can point its own domain at your
+    server's LAN IP; the browser then sends LAN-looking requests and lets the page
+    read the answers (including the token in the manifest). Those requests carry
+    the attacker's domain in Host, so LAN-granted access requires a Host that an
+    outsider cannot control: an IP literal, localhost, a single-label name ("nas"),
+    a local-only suffix (.local, .lan, .home.arpa, .internal, .ts.net), or ALLOWED_HOSTS.
+    """
+    host = _first_header_value(request.headers.get("host")).lower()
+    if host.startswith("["):
+        return _parse_ip(host) is not None
+    name = host.rsplit(":", 1)[0].rstrip(".") if host.count(":") <= 1 else host
+    if not name:
+        return False
+    if name in ("localhost", "testserver", "testclient") or name in ALLOWED_HOSTS:
+        return True
+    if _parse_ip(name) is not None:
+        return True
+    if "." not in name:
+        return True
+    return name.endswith(_LOCAL_HOST_SUFFIXES)
+
+
+def _origin_is_same_site(request: Request) -> bool:
+    """CSRF guard for state-changing requests: a foreign page's form/fetch carries its own Origin."""
+    origin = request.headers.get("origin")
+    if not origin or origin == "null":
+        return origin is None
+    origin_host = urlparse(origin).netloc.lower()
+    return origin_host == _first_header_value(request.headers.get("host")).lower()
+
+
 def _has_valid_token_prefix(path: str) -> bool:
     """Constant-time check that the path starts with /s/<SECRET_TOKEN>."""
     if not SECRET_TOKEN or not path.startswith("/s/"):
@@ -267,20 +387,22 @@ def _spawn_background(coro) -> None:
     task.add_done_callback(_background_tasks.discard)
 
 
-async def _archive_in_background(clean_id: str, stream_url: str, base_url: str) -> None:
+async def _archive_in_background(clean_id: str, quality: str, base_url: str) -> None:
     """Looks up metadata and hands the track to the archiver without delaying playback."""
     try:
-        direct_url: Optional[str] = stream_url
-        if "/stream/audio/" in stream_url:
-            # Our own proxy URL is not downloadable by the archiver. Only snowflake
-            # IDs have a mirror endpoint that returns audio; for every other ID
-            # <mirror>/track/<id> returns JSON, which must never be archived as audio.
-            # With no direct URL the archiver copies from the local audio cache instead.
-            direct_url = None
-            if is_snowflake_id(clean_id):
-                ranked = mirror_manager.get_ranked_mirrors()
-                if ranked:
-                    direct_url = f"{ranked[0]}/track/{clean_id}"
+        # The URL handed to the client is our own proxy, which the archiver cannot
+        # download from. Only snowflake IDs have a mirror endpoint that returns
+        # audio; for every other ID <mirror>/track/<id> returns JSON, which must
+        # never be archived as audio. With no direct URL the archiver copies from
+        # the local audio cache instead.
+        direct_url: Optional[str] = None
+        if is_snowflake_id(clean_id):
+            ranked = mirror_manager.get_ranked_mirrors()
+            if ranked:
+                direct_url = f"{ranked[0]}/track/{clean_id}"
+        else:
+            upstream = await stream_resolver.resolve_upstream(clean_id, quality)
+            direct_url = upstream.url or None
 
         track = await stream_resolver.get_track(clean_id, base_url)
         if track:
@@ -307,12 +429,25 @@ async def _cache_cleanup_loop():
 async def lifespan(app: FastAPI):
     """Application startup and shutdown orchestration."""
     logger.info("Initializing hifi-bridge microservice...")
-    if SECRET_TOKEN:
-        logger.info("SECRET_TOKEN is active: external BitChord routes require /s/<SECRET_TOKEN>/...")
-        if len(SECRET_TOKEN) < 16:
-            logger.warning("SECRET_TOKEN is shorter than 16 characters; use a longer random value.")
+    if TOKEN_ORIGIN == "env":
+        logger.info("Using SECRET_TOKEN from the environment.")
     else:
-        logger.warning("SECRET_TOKEN is not set: BitChord routes are accessible without token prefix.")
+        # Printed only for a token FlacJack made itself, so the owner can find it.
+        # A token you set yourself is never written to the logs.
+        print(
+            "\n" + "=" * 72 + "\n"
+            f"  FlacJack secret token ({'newly generated' if TOKEN_ORIGIN == 'generated' else 'from ' + TOKEN_FILE}):\n"
+            f"    {SECRET_TOKEN}\n"
+            "  Add this to BitChord as:\n"
+            f"    http(s)://<your-host>/s/{SECRET_TOKEN}/bitchord-module.json\n"
+            "  Keep it private. To change it, delete the token file or set SECRET_TOKEN.\n"
+            + "=" * 72 + "\n",
+            flush=True,
+        )
+    if ALLOW_LAN_WITHOUT_TOKEN:
+        logger.warning("ALLOW_LAN_WITHOUT_TOKEN is on: LAN/Tailscale clients can use FlacJack without the token.")
+    if not WEBUI_ENABLED:
+        logger.info("WebUI and admin APIs are disabled (set WEBUI_ENABLED=true to enable them on the LAN).")
     if LAN_CIDRS_CONFIGURED:
         logger.info(f"LAN_CIDRS active: {', '.join(str(n) for n in LAN_NETWORKS) or 'loopback only'}")
 
@@ -346,53 +481,64 @@ app = FastAPI(
     openapi_url=None,
 )
 
-# No cookies or HTTP auth are used, so credentials stay off.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Previously allow_origins=["*"], which let ANY website open in a browser on your
+# LAN fetch() this server and read the answers, including the token in the
+# manifest. BitChord is a native app and is unaffected by CORS.
+if CORS_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=CORS_ORIGINS,
+        allow_credentials=False,
+        allow_methods=["GET", "HEAD"],
+        allow_headers=["Range"],
+    )
+
+
+_ADMIN_PREFIXES = ("/api/", "/mirrors")
+
+
+def _not_found() -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": "Not found"})
 
 
 @app.middleware("http")
 async def security_gate_middleware(request: Request, call_next):
     """
-    1. Allows /health (Docker health checks).
-    2. Restricts WebUI (/, /dashboard) and admin APIs (/api/*, /mirrors*) to LAN IPs only.
-    3. Enforces /s/<SECRET_TOKEN>/ prefix on BitChord & audio routes when SECRET_TOKEN is set.
+    1. Allows /health (Docker health checks); outsiders only get a bare status.
+    2. WebUI (/, /dashboard) and admin APIs (/api/*, /mirrors*) exist only with
+       WEBUI_ENABLED=true, and then only for LAN clients using a trusted Host,
+       with a same-origin check on POSTs.
+    3. Enforces /s/<SECRET_TOKEN>/ on BitChord & audio routes. Unprefixed access
+       only with ALLOW_LAN_WITHOUT_TOKEN=true, from the LAN, with a trusted Host.
+    Every refusal is a 404 so a probe cannot tell that the service exists.
     """
     path = request.url.path
 
     if path == "/health":
         return await call_next(request)
 
-    lan = is_lan_request(request)
+    lan = is_lan_request(request) and _host_is_trusted(request)
 
-    # LAN-only WebUI & management routes
-    if path in ("/", "/dashboard") or path.startswith("/api/") or path.startswith("/mirrors"):
-        if not lan:
-            return JSONResponse(status_code=404, content={"detail": "Not found"})
+    if path in ("/", "/dashboard") or path.startswith(_ADMIN_PREFIXES):
+        if not WEBUI_ENABLED or not lan:
+            return _not_found()
+        if request.method not in ("GET", "HEAD", "OPTIONS") and not _origin_is_same_site(request):
+            return JSONResponse(status_code=403, content={"detail": "Cross-site request refused"})
         return await call_next(request)
 
-    # Token-protected BitChord & streaming routes
-    if SECRET_TOKEN:
-        if _has_valid_token_prefix(path):
-            return await call_next(request)
-        # Allow unprefixed calls only from local LAN for quick testing
-        if lan:
-            return await call_next(request)
-        return JSONResponse(status_code=403, content={"detail": "Forbidden"})
-
-    return await call_next(request)
+    if _has_valid_token_prefix(path) or (lan and ALLOW_LAN_WITHOUT_TOKEN):
+        return await call_next(request)
+    return _not_found()
 
 
 # ── Health & Status Endpoints ────────────────────────────────────────────────
 
-@app.get("/health", response_model=HealthResponse, tags=["Monitoring"])
-async def health_check():
-    """System health check and live mirror pool summary."""
+@app.get("/health", tags=["Monitoring"])
+async def health_check(request: Request):
+    """System health check. Details (mirror pool, cache, uptime) are LAN-only."""
+    if not (is_lan_request(request) and _host_is_trusted(request)):
+        summary = mirror_manager.get_summary()
+        return {"status": "healthy" if summary.healthy > 0 else "degraded"}
     uptime = time.time() - START_TIME
     summary = mirror_manager.get_summary()
     cache_count = await db.get_total_cache_entries()
@@ -518,7 +664,7 @@ async def resolve_stream(
     stream_info = await stream_resolver.resolve_stream(clean_id, quality=quality, base_url=base_url)
 
     if archiver.enabled:
-        _spawn_background(_archive_in_background(clean_id, stream_info.url, base_url))
+        _spawn_background(_archive_in_background(clean_id, quality, base_url))
 
     return stream_info
 
@@ -531,8 +677,7 @@ async def stream_audio_file(track_id: str, request: Request):
 
 # Mount router at root (for LAN) and under /s/{SECRET_TOKEN} (for external BitChord)
 app.include_router(bitchord_router)
-if SECRET_TOKEN:
-    app.include_router(bitchord_router, prefix=f"/s/{SECRET_TOKEN}")
+app.include_router(bitchord_router, prefix=f"/s/{SECRET_TOKEN}")
 
 
 # ── Operational & Cache APIs (LAN Only) ──────────────────────────────────────

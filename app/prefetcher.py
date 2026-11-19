@@ -1,6 +1,6 @@
 """
 Smart Lookahead Prefetcher & Local Audio Disk Cache for hifi-bridge.
-Caches audio files locally for 0ms latency playback, immune to upstream rate limits.
+Caches audio files locally so repeat plays are instant and do not contact upstream again.
 Automatically pre-resolves and buffers the next tracks in queue/album in the background.
 """
 
@@ -284,11 +284,11 @@ class PrefetchManager:
                 for m in mirror_manager.get_ranked_mirrors():
                     candidate_urls.append(f"{m}/track/{clean_id}")
             else:
-                resolved = await stream_resolver.resolve_stream(clean_id, QualityTier.HI_RES_LOSSLESS.value)
-                if resolved.url and resolved.url.startswith("http") and "/stream/audio/" not in resolved.url:
+                # For non-snowflake IDs <mirror>/track/<id> is a JSON API reply,
+                # so the resolved direct URL is the only real audio source.
+                resolved = await stream_resolver.resolve_upstream(clean_id, QualityTier.HI_RES_LOSSLESS.value)
+                if resolved.url.startswith("http"):
                     candidate_urls.append(resolved.url)
-                for m in mirror_manager.get_ranked_mirrors():
-                    candidate_urls.append(f"{m}/track/{clean_id}")
 
             # 2. Try candidate mirrors
             success = False
@@ -297,6 +297,8 @@ class PrefetchManager:
                     headers = {
                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                         "Accept": "*/*",
+                        # Keep the bytes on disk identical to what upstream serves.
+                        "Accept-Encoding": "identity",
                     }
                     async with self._stream_client.stream("GET", target_url, headers=headers) as resp:
                         if resp.status_code == 429:
@@ -308,7 +310,7 @@ class PrefetchManager:
                             continue
 
                         ct = resp.headers.get("content-type", "").lower()
-                        if ct.startswith("text/") or "html" in ct or "xml" in ct:
+                        if ct.startswith("text/") or "html" in ct or "xml" in ct or "json" in ct:
                             continue
 
                         expected_bytes = 0
@@ -353,8 +355,15 @@ class PrefetchManager:
             def _finalize_prefetch():
                 with open(temp_path, "rb") as f:
                     header = f.read(16)
-                is_flac = header.startswith(b"fLaC")
-                ext = ".flac" if is_flac else ".m4a"
+                if header.startswith(b"fLaC"):
+                    ext = ".flac"
+                elif header[4:8] == b"ftyp":
+                    ext = ".m4a"
+                else:
+                    # Not audio we recognise (an error page, JSON, ...). Caching it
+                    # would make the track "play" and then fail instantly.
+                    os.remove(temp_path)
+                    return None
 
                 final_path = os.path.join(self.cache_dir, f"{clean_id}{ext}")
                 if os.path.exists(final_path):
@@ -363,6 +372,9 @@ class PrefetchManager:
                 return final_path
 
             final_path = await asyncio.to_thread(_finalize_prefetch)
+            if final_path is None:
+                logger.warning(f"[PREFETCH] Not caching {clean_id}: unrecognised audio container")
+                return
             size_mb = round(os.path.getsize(final_path) / (1024 * 1024), 2)
             logger.info(f"[PREFETCH] Successfully pre-cached track {clean_id} ({size_mb} MB) -> {final_path}")
 

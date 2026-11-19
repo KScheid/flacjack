@@ -12,6 +12,9 @@ Tests:
 import asyncio
 import json
 import os
+
+# These checks call the unprefixed routes from the TestClient, which counts as LAN.
+os.environ.setdefault("ALLOW_LAN_WITHOUT_TOKEN", "true")
 import sys
 import time
 
